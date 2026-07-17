@@ -2181,7 +2181,13 @@ def _run_ols(df):
     model = sm.OLS(y, X, missing="drop").fit()
 
     d = d.reset_index(drop=True)
-    d["ln_price_hat"] = mat_base.reset_index(drop=True) + model.predict(X)
+    mat_base = mat_base.reset_index(drop=True)
+    # model.predict pode devolver menos linhas que d se OLS(missing="drop")
+    # descartou linhas com NaN/inf. Reindexamos pela posição de X para alinhar
+    # com d antes de somar mat_base, evitando erro de broadcast (shapes diferentes).
+    pred = pd.Series(np.asarray(model.predict(X)), index=X.index)
+    pred = pred.reindex(range(len(d)))
+    d["ln_price_hat"] = mat_base + pred
     d["resid"] = d["ln_price"] - d["ln_price_hat"]
     d["price_ratio"] = np.exp(d["resid"])
     d["price_expected"] = np.exp(d["ln_price_hat"])

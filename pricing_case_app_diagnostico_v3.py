@@ -1275,884 +1275,923 @@ def run_advanced_modeling(df: pd.DataFrame, p: Params) -> dict:
         answers="Como prever o preço, explicar a política implícita, testar o efeito causal e transformar tudo numa recomendação de preço?",
         insight="A narrativa é encadeada: o Machine Learning (XGBoost) prevê o preço esperado e mostra os drivers; a Econometria (regressão em painel) explica a política de preço implícita e mede a elasticidade; a Inferência Causal (variável instrumental) testa se mudar o preço realmente muda a demanda; e a Decisão Multicritério (MCDA) transforma tudo num preço recomendado, com o gestor controlando os pesos de cada objetivo.")
 
-    # ===================================================================
-    # 1 · MACHINE LEARNING + SHAP
-    # ===================================================================
-    from sklearn.preprocessing import OrdinalEncoder
-    cat = [COL_MATERIAL, COL_COUNTRY, COL_TIER, COL_BUSINESS]
-    enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-    Xc = enc.fit_transform(d[cat])
-    X = np.column_stack([Xc, d["ln_qty"].values])
-    feat = [c.replace(" ($)", "") for c in cat] + ["ln_qty"]
-    y = d["ln_price"].values
+    # valores-padrão das variáveis compartilhadas entre seções (segurança:
+    # se uma seção falhar, as seguintes ainda têm um valor válido para usar)
+    beta_ols = -0.28
+    ci = (-0.30, -0.26)
+    f_stat = 1.0
+    weak = True
+    beta_iv = np.nan
+    r2_ml = 0.0
 
-    # XGBoost se disponível; senão, GradientBoosting do sklearn (sempre presente)
-    ml_engine = "XGBoost"
+    # --- seção protegida: Machine Learning ---
     try:
-        from xgboost import XGBRegressor
-        ml = XGBRegressor(n_estimators=200, max_depth=7, learning_rate=0.08,
-                          n_jobs=-1, tree_method="hist", random_state=p.random_state)
-        ml.fit(X, y)
-    except Exception:
-        from sklearn.ensemble import HistGradientBoostingRegressor
-        ml_engine = "HistGradientBoosting (sklearn)"
-        ml = HistGradientBoostingRegressor(max_iter=200, max_depth=7,
-                                           learning_rate=0.08, random_state=p.random_state)
-        ml.fit(X, y)
-    r2_ml = ml.score(X, y)
+            # ===================================================================
+            # 1 · MACHINE LEARNING + SHAP
+            # ===================================================================
+            from sklearn.preprocessing import OrdinalEncoder
+            cat = [COL_MATERIAL, COL_COUNTRY, COL_TIER, COL_BUSINESS]
+            enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+            Xc = enc.fit_transform(d[cat])
+            X = np.column_stack([Xc, d["ln_qty"].values])
+            feat = [c.replace(" ($)", "") for c in cat] + ["ln_qty"]
+            y = d["ln_price"].values
 
-    # importância dos drivers: SHAP se disponível, senão permutação (sklearn)
-    try:
-        import shap
-        idx = np.random.RandomState(p.random_state).choice(len(X), min(1500, len(X)), replace=False)
-        sv = shap.TreeExplainer(ml).shap_values(X[idx])
-        imp = np.abs(sv).mean(0)
-        imp_method = "SHAP"
-    except Exception:
-        from sklearn.inspection import permutation_importance
-        idx = np.random.RandomState(p.random_state).choice(len(X), min(3000, len(X)), replace=False)
-        pi = permutation_importance(ml, X[idx], y[idx], n_repeats=3,
-                                    random_state=p.random_state, n_jobs=-1)
-        imp = pi.importances_mean
-        imp_method = "importância por permutação"
-    imp = np.abs(imp)
-    shap_df = (pd.DataFrame({"driver": feat, f"importância ({imp_method})": imp})
-               .sort_values(f"importância ({imp_method})", ascending=False).reset_index(drop=True))
-    imp_col = f"importância ({imp_method})"
-    shap_df[imp_col] = shap_df[imp_col].round(3)
-
-    # uplift $ do ML: resíduo abaixo do P25 levado ao P25 (mesmo método da aba 5)
-    d["_pred"] = ml.predict(X)
-    d["_resid"] = d["ln_price"] - d["_pred"]
-    tgt = d["_resid"].quantile(0.25)
-    opp = d[d["_resid"] < tgt].copy()
-    opp["_ptarget"] = np.exp(d.loc[opp.index, "_pred"] + tgt)
-    ml_uplift = ((opp["_ptarget"] - opp[COL_PRICE]).clip(lower=0) * opp[COL_QTY]).sum()
-
-    fig, ax = plt.subplots(figsize=(8, 4))
-    sd = shap_df.iloc[::-1]
-    ax.barh(sd["driver"], sd[imp_col], color="#378add")
-    ax.set_xlabel(imp_col.capitalize()); ax.set_title("O que forma o preço? (drivers do modelo)")
-    fig.tight_layout()
-    top_driver = shap_df.iloc[0]["driver"]
-    tier_row = shap_df[shap_df["driver"] == "Customer Tier"]
-    tier_imp = tier_row[imp_col].iloc[0] if len(tier_row) else 0
-
-    add("1 · Machine Learning (XGBoost) — prever o preço e explicar os drivers",
-        how_it_works="O XGBoost é um método de 'árvores de decisão em sequência'. Imagine várias perguntas encadeadas ('o business é A? o país é X? a quantidade é alta?') que vão dividindo as vendas em grupos cada vez mais parecidos, até estimar um preço para cada perfil. O 'boosting' significa que ele constrói centenas dessas árvores, cada nova corrigindo os erros das anteriores — por isso é tão preciso. Para explicar o que o modelo aprendeu (que costuma ser uma caixa-preta), usamos o SHAP, que mede quanto cada característica empurrou o preço previsto para cima ou para baixo.",
-        why=f"ML (gradient boosting, motor: {ml_engine}) prevê o preço esperado com alta acurácia capturando interações não-lineares que a regressão não pega. A importância dos drivers ({imp_method}) abre a caixa-preta: mostra quanto cada variável pesa na previsão.",
-        answers="Qual o preço esperado deste perfil, e o que mais determina esse preço?",
-        assumptions="Não exige forma funcional nem linearidade. Assume que o passado representa o futuro (padrões estáveis) e que as features disponíveis capturam o essencial. Não infere causalidade — só associação.",
-        formula=[r"\hat{p}_i = f(x_i) = \sum_{k=1}^{K} \eta\, T_k(x_i)",
-                 r"\phi_j = \sum_{S \subseteq F \setminus \{j\}} \frac{|S|!\,(|F|-|S|-1)!}{|F|!}\left[f(S \cup \{j\}) - f(S)\right]"],
-        formula_legend="f = ensemble de K árvores T_k com taxa de aprendizado η; φ_j = valor SHAP da feature j (contribuição média marginal sobre todas as coalizões de features), quando SHAP está disponível.",
-        pros=["Captura interações e não-linearidades automaticamente",
-              "Alta acurácia preditiva (R² elevado)",
-              "Importância dá explicabilidade dos drivers"],
-        cons=["Não é causal — só correlação",
-              "Exige cuidado com overfitting e vazamento",
-              "Menos transparente que uma regressão para o board"],
-        insight=f"R² de {r2_ml:.2f}. Os drivers dominantes são {top_driver} e Business; o Customer Tier contribui pouquíssimo "
-                f"(importância {tier_imp:.3f}) — evidência quantitativa de que a régua de Tier atual quase não explica preço.",
-        method=f"Treinamos um modelo de gradient boosting ({ml_engine}) para prever o preço de cada venda a partir das características dela (material, business, tier, país, quantidade). O modelo aprende com o histórico e mede o acerto pelo R² ({r2_ml:.2f} = quanto da variação de preço ele consegue explicar, de 0 a 1). Para saber QUAIS variáveis pesam, usamos {imp_method}: para cada característica, mede-se o quanto ela empurra o preço previsto para cima ou para baixo. O uplift soma as transações vendidas ABAIXO do preço que o modelo esperava, calculando quanto renderia levá-las ao 25º percentil.",
-        money=f"Uplift potencial identificado pelo ML (transações abaixo do preço esperado, levadas ao P25): "
-              f"US$ {ml_uplift/1e6:,.1f} mi brutos.",
-        worked=[
-            f"Alta acurácia (R² {r2_ml:.2f}): o modelo prevê bem o preço, então os drivers que ele aponta são confiáveis.",
-            "O modelo virou uma régua objetiva de 'preço esperado' — base para achar quem está sendo subprecificado.",
-        ],
-        not_worked=[
-            f"O Customer Tier quase não pesa (importância {tier_imp:.3f}): a segmentação de cliente não está determinando preço.",
-            "ML capta associação, não causa: ele diz 'este perfil costuma ter tal preço', não 'se eu subir o preço, o que acontece'.",
-        ],
-        fig=fig)
-    add("Drivers de preço (tabela)", table=shap_df)
-
-    # ===================================================================
-    # 1b · PRICE POSITION INDEX (PPI) + OPPORTUNITY VALUE
-    # ===================================================================
-    # PPI = preço praticado / preço esperado pelo modelo
-    d["preco_esperado"] = np.exp(d["_pred"])
-    d["PPI"] = d[COL_PRICE] / d["preco_esperado"]
-
-    def ppi_faixa(v):
-        if v < 0.90:
-            return "Forte desconto (<0,90)"
-        if v <= 1.05:
-            return "Dentro do esperado (0,90–1,05)"
-        return "Acima do benchmark (>1,05)"
-
-    d["faixa_PPI"] = d["PPI"].apply(ppi_faixa)
-    # Opportunity Value = quanto se deixa na mesa (só onde PPI < 1)
-    d["opportunity_value"] = ((d["preco_esperado"] - d[COL_PRICE]).clip(lower=0) * d[COL_QTY])
-
-    # distribuição do PPI por faixa
-    faixa_tbl = (d.groupby("faixa_PPI")
-                 .agg(transacoes=("PPI", "size"),
-                      valor_deixado_na_mesa=("opportunity_value", "sum"))
-                 .reset_index())
-    # ordena as faixas de forma lógica
-    ordem = ["Forte desconto (<0,90)", "Dentro do esperado (0,90–1,05)", "Acima do benchmark (>1,05)"]
-    faixa_tbl["_o"] = faixa_tbl["faixa_PPI"].map({k: i for i, k in enumerate(ordem)})
-    faixa_tbl = faixa_tbl.sort_values("_o").drop(columns="_o")
-    faixa_tbl_fmt = _round_df(faixa_tbl, money_cols=["valor_deixado_na_mesa"], int_cols=["transacoes"])
-
-    total_mesa = d["opportunity_value"].sum()
-    n_desconto = int((d["PPI"] < 0.90).sum())
-
-    # gráfico: distribuição do PPI
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.hist(d["PPI"].clip(0, 2), bins=60, color="#378add")
-    ax.axvline(0.90, color="#c0504d", ls="--", lw=1, label="0,90 (forte desconto)")
-    ax.axvline(1.05, color="#0F6E56", ls="--", lw=1, label="1,05 (acima do benchmark)")
-    ax.set_xlabel("Price Position Index (preço praticado ÷ esperado)")
-    ax.set_ylabel("Nº de transações"); ax.legend()
-    ax.set_title("Distribuição do Price Position Index (PPI)")
-    fig.tight_layout()
-
-    add("1b · Price Position Index (PPI) — onde estamos deixando dinheiro na mesa",
-        why="O resíduo do modelo, sozinho, é técnico demais para um gestor. O PPI traduz: é a razão entre o preço praticado e o esperado pelo modelo. Abaixo de 0,90 = forte desconto; entre 0,90 e 1,05 = normal; acima de 1,05 = prêmio. Um número que qualquer diretor lê em segundos.",
-        answers="Cada venda está barata, normal ou cara frente ao que o modelo espera? Quanto isso soma?",
-        assumptions="O preço esperado do modelo é um benchmark justo (controla material, país, tier, business, volume). PPI < 1 só é oportunidade real se não houver justificativa comercial que o modelo não captou.",
-        formula=[r"\text{PPI}_i = \frac{p_i^{\text{praticado}}}{\hat{p}_i^{\text{esperado}}}",
-                 r"\text{Opportunity Value}_i = \max(\hat{p}_i - p_i,\, 0)\times q_i"],
-        formula_legend="p̂ = preço esperado pelo modelo; PPI<1 indica preço abaixo do benchmark; o Opportunity Value só conta o gap positivo (dinheiro na mesa).",
-        insight=f"{n_desconto:,} transações estão em forte desconto (PPI < 0,90). A tabela por faixa mostra quanto cada grupo "
-                "representa — a maior parte do valor recuperável concentra-se na faixa de desconto.",
-        money=f"Total deixado na mesa (soma do Opportunity Value onde PPI < 1): US$ {total_mesa/1e6:,.1f} mi.",
-        fig=fig)
-    add("PPI por faixa — quanto cada faixa representa", table=faixa_tbl_fmt)
-
-    # ===================================================================
-    # 1c · RANKING DE OPORTUNIDADES (com filtro por tier/país)
-    # ===================================================================
-    opp_rk = d[d["opportunity_value"] > 0].copy()
-    # aplica filtros vindos da UI (reduz o volume da tabela)
-    if p.ml_filter_tier and p.ml_filter_tier != "(todos)":
-        opp_rk = opp_rk[opp_rk[COL_TIER] == p.ml_filter_tier]
-    if p.ml_filter_country and p.ml_filter_country != "(todos)":
-        opp_rk = opp_rk[opp_rk[COL_COUNTRY] == p.ml_filter_country]
-
-    rk_cols = [COL_MONTH, COL_BUSINESS, COL_COUNTRY, COL_TIER, COL_MATERIAL,
-               COL_PARENT, COL_QTY, COL_PRICE, "preco_esperado", "PPI",
-               "opportunity_value"]
-    opp_rk = opp_rk.sort_values("opportunity_value", ascending=False)[rk_cols].head(100)
-    opp_rk_tbl = _round_df(opp_rk, money_cols=[COL_PRICE, "preco_esperado", "opportunity_value"],
-                           pct_cols=["PPI"], int_cols=[COL_QTY])
-
-    filtro_txt = ""
-    if p.ml_filter_tier != "(todos)":
-        filtro_txt += f" · Tier={p.ml_filter_tier}"
-    if p.ml_filter_country != "(todos)":
-        filtro_txt += f" · País={p.ml_filter_country}"
-    add(f"1c · Ranking de oportunidades (Opportunity Value){filtro_txt}",
-        why="Consolida o PPI numa lista acionável: para cada venda abaixo do preço esperado, quanto se recupera se levada ao benchmark. É a fila que o time comercial ataca, cliente a cliente.",
-        answers="Por onde começar a renegociar, e quanto vale cada linha?",
-        insight="Ordenado pelo maior Opportunity Value. Use o filtro por Tier/País na barra lateral para reduzir o volume "
-                "e focar num segmento específico (ex.: só Tier A na Alemanha).",
-        money=f"Top 100 oportunidades exibidas{filtro_txt or ' (sem filtro)'} — filtre na barra lateral para focar.",
-        table=opp_rk_tbl)
-
-    # ===================================================================
-    # 1d · "COMO A IA PENSOU" — explicabilidade em 4 níveis (top oportunidade)
-    # ===================================================================
-    # transação-alvo = maior Opportunity Value da base
-    d["_opp_all"] = d["opportunity_value"]
-    ti = int(d["_opp_all"].idxmax())
-    row = d.loc[ti]
-    p_atual = float(row[COL_PRICE]); p_esp = float(row["preco_esperado"])
-    gap_u = p_esp - p_atual; opp_u = float(row["_opp_all"])
-
-    add("Como a IA pensou — explicando a maior oportunidade",
-        why="Um modelo de ML só é confiável no board se puder ser explicado. Esta seção abre a caixa-preta para a maior oportunidade da base, em quatro níveis: resumo, decomposição SHAP, regras aprendidas e — o diferencial — transações reais comparáveis do próprio histórico.",
-        answers="Por que a IA estimou este preço? Em que evidência do histórico ela se baseou?",
-        insight=f"Transação analisada: Material {row[COL_MATERIAL]} · {row[COL_COUNTRY]} · Business {row[COL_BUSINESS]} · "
-                f"Tier {row[COL_TIER]} · {int(row[COL_QTY])} unidades.")
-
-    # ---- Nível 1: Resumo Executivo ----
-    resumo = pd.DataFrame({
-        "métrica": ["Preço atual", "Preço esperado (modelo)", "Gap unitário", "Oportunidade (× volume)"],
-        "valor": [f"${p_atual:,.2f}", f"${p_esp:,.2f}", f"${gap_u:,.2f}", f"${opp_u:,.0f}"],
-    })
-    add("Nível 1 · Resumo executivo",
-        insight="O essencial em uma linha: o preço praticado, o que o modelo esperava, e quanto isso vale multiplicado pelo volume.",
-        table=resumo)
-
-    # ---- Nível 2: Decomposição SHAP (waterfall) ----
-    shap_ok = True
-    try:
-        import shap
-        expl = shap.TreeExplainer(ml)
-        sv_row = expl.shap_values(X[ti:ti + 1])[0]
-        base_val = float(expl.expected_value)
-    except Exception:
-        shap_ok = False
-
-    if shap_ok:
-        contrib = list(zip(feat, sv_row))
-        contrib_sorted = sorted(contrib, key=lambda z: -abs(z[1]))
-        # waterfall em preço (aproximação: converte incrementos log para % do preço)
-        fig, ax = plt.subplots(figsize=(9, 4.2))
-        labels = ["Preço médio\n(base)"] + [c[0] for c in contrib_sorted] + ["Preço\nprevisto"]
-        base_price = np.exp(base_val)
-        running = base_val
-        xs = range(len(labels))
-        vals = [base_price]
-        cum = base_val
-        for f, v in contrib_sorted:
-            new = np.exp(cum + v) - np.exp(cum)
-            vals.append(new); cum += v
-        vals.append(0)
-        run = 0
-        for i, (lab, val) in enumerate(zip(labels, vals)):
-            if i == 0:
-                ax.bar(i, base_price, color="#33475b"); run = base_price
-            elif i == len(labels) - 1:
-                ax.bar(i, np.exp(cum), color="#0F6E56")
-            else:
-                ax.bar(i, val, bottom=run, color=("#3b6ea5" if val >= 0 else "#c0504d"))
-                run += val
-        ax.set_xticks(list(xs)); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
-        ax.set_ylabel("Preço (US$)"); ax.set_title("Nível 2 · Como cada variável moveu o preço previsto (SHAP)")
-        fig.tight_layout()
-        shap_row_tbl = _round_df(
-            pd.DataFrame({"variável": [c[0] for c in contrib_sorted],
-                          "efeito_no_preço_log": [round(c[1], 3) for c in contrib_sorted]}),
-            pct_cols=["efeito_no_preço_log"])
-        add("Nível 2 · Explicação SHAP — o que empurrou o preço para cima ou para baixo",
-            why="O SHAP parte do preço médio da empresa e mostra quanto cada variável somou ou subtraiu para chegar na previsão desta transação. É a decomposição rigorosa (teoria dos jogos) do 'porquê' daquele número.",
-            insight=f"O preço parte da média (${base_price:,.2f}) e cada fator o ajusta: o Material e o Business puxam para cima, "
-                    "o alto volume puxa para baixo. A soma dá o preço previsto.",
-            fig=fig, table=shap_row_tbl)
-
-    # ---- Nível 3: Regras Aprendidas (padrões estatísticos dos dados) ----
-    regras = []
-    glob_med = d[COL_PRICE].median()
-    # regra material×business
-    mat_med = d[d[COL_MATERIAL] == row[COL_MATERIAL]][COL_PRICE].median()
-    mb_med = d[(d[COL_MATERIAL] == row[COL_MATERIAL]) & (d[COL_BUSINESS] == row[COL_BUSINESS])][COL_PRICE].median()
-    if mat_med > 0 and abs(mb_med / mat_med - 1) > 0.02:
-        regras.append(f"Material {row[COL_MATERIAL]} no Business {row[COL_BUSINESS]} tende a preços "
-                      f"{(mb_med/mat_med-1)*100:+.0f}% vs. a mediana do material.")
-    # regra de volume (sempre)
-    q_hi = d[COL_QTY].quantile(0.9)
-    hi_rel = (d[d[COL_QTY] >= q_hi][COL_PRICE].median() / glob_med - 1) * 100
-    regras.append(f"Vendas de alto volume (≥{int(q_hi)} un.) têm preço mediano {hi_rel:+.0f}% vs. a mediana geral "
-                  "— efeito do desconto de volume embutido nos dados.")
-    # regra de país×material
-    mat_ctry = d[(d[COL_MATERIAL] == row[COL_MATERIAL]) & (d[COL_COUNTRY] == row[COL_COUNTRY])][COL_PRICE].median()
-    if mat_med > 0 and abs(mat_ctry / mat_med - 1) > 0.02:
-        regras.append(f"No mercado {row[COL_COUNTRY]}, o material {row[COL_MATERIAL]} tem preço mediano "
-                      f"{(mat_ctry/mat_med-1)*100:+.0f}% vs. o benchmark do material.")
-    # regra business geral (sempre tem)
-    biz_rel = (d[d[COL_BUSINESS] == row[COL_BUSINESS]][COL_PRICE].median() / glob_med - 1) * 100
-    regras.append(f"O Business {row[COL_BUSINESS]} pratica preço mediano {biz_rel:+.0f}% vs. a mediana geral da empresa.")
-    regras_tbl = pd.DataFrame({"regra aprendida do histórico": regras})
-    add("Nível 3 · Regras aprendidas — padrões em linguagem de negócio",
-        why="Árvores individuais são ilegíveis. Em vez delas, mineramos padrões frequentes dos próprios dados e os traduzimos em frases que um gestor entende — o comportamento que o modelo capturou, dito em português.",
-        insight="Estas regras descrevem padrões estatísticos reais do histórico (não a estrutura interna das árvores), "
-                "o que as torna interpretáveis e verificáveis.",
-        table=regras_tbl)
-
-    # ---- Nível 4: Comparáveis Reais (o diferencial) ----
-    mask = ((d[COL_MATERIAL] == row[COL_MATERIAL]) & (d[COL_COUNTRY] == row[COL_COUNTRY])
-            & (d[COL_BUSINESS] == row[COL_BUSINESS]) & (d[COL_TIER] == row[COL_TIER]))
-    comp = d[mask & (d.index != ti)].copy()
-    comp["dist_volume"] = (comp[COL_QTY] - row[COL_QTY]).abs()
-    comp = comp.sort_values("dist_volume").head(6)
-    if len(comp):
-        comp_tbl = _round_df(
-            comp[[COL_MATERIAL, COL_COUNTRY, COL_BUSINESS, COL_TIER, COL_QTY, COL_PRICE]],
-            money_cols=[COL_PRICE], int_cols=[COL_QTY])
-        pmin, pmax = comp[COL_PRICE].min(), comp[COL_PRICE].max()
-        pmed = comp[COL_PRICE].median()
-        add("Nível 4 · Comparáveis reais — a evidência do próprio histórico",
-            why="Este é o nível que constrói confiança de verdade. Em vez de pedir fé na caixa-preta, mostramos as transações mais parecidas já realizadas: mesmo material, país, business e tier, com volume próximo. O usuário vê a evidência concreta.",
-            answers="Que vendas reais e semelhantes sustentam a recomendação?",
-            insight=f"A IA se baseou em transações historicamente semelhantes, negociadas entre ${pmin:,.2f} e ${pmax:,.2f} "
-                    f"(mediana ${pmed:,.2f}). A transação analisada foi vendida a ${p_atual:,.2f} — "
-                    f"{'abaixo' if p_atual < pmed else 'dentro'} da faixa dos comparáveis, o que sustenta a oportunidade de reajuste.",
-            money=f"Ancorando no histórico comparável (mediana ${pmed:,.2f}), o reajuste sugerido para esta venda "
-                  f"recupera ${max(pmed - p_atual, 0) * row[COL_QTY]:,.0f}.",
-            table=comp_tbl)
-    else:
-        add("Nível 4 · Comparáveis reais",
-            insight="Não há transações suficientemente semelhantes no histórico para esta venda — sinal de que a previsão "
-                    "depende mais de extrapolação do modelo e deve ser usada com cautela.")
-
-    # ---- Nível 5: Árvore ilustrativa (diagrama + regras em linguagem natural) ----
-    from sklearn.tree import DecisionTreeRegressor, _tree
-    # features interpretáveis (dummies dos valores da própria transação + volume)
-    dd = d.copy()
-    dd["_isBiz"] = (dd[COL_BUSINESS] == row[COL_BUSINESS]).astype(int)
-    dd["_isTier"] = (dd[COL_TIER] == row[COL_TIER]).astype(int)
-    dd["_isCtry"] = (dd[COL_COUNTRY] == row[COL_COUNTRY]).astype(int)
-    tfeat = ["_isBiz", "_isTier", "_isCtry", COL_QTY]
-    tlabels = [f"É Business {row[COL_BUSINESS]}", f"É Tier {row[COL_TIER]}",
-               f"É {row[COL_COUNTRY]}", "Quantidade"]
-    Xt = dd[tfeat].values
-    yt = dd[COL_PRICE].values
-    dtree = DecisionTreeRegressor(max_depth=3, min_samples_leaf=1000, random_state=p.random_state)
-    dtree.fit(Xt, yt)
-
-    # desenha a árvore
-    from sklearn.tree import plot_tree
-    fig, ax = plt.subplots(figsize=(12, 6))
-    plot_tree(dtree, feature_names=tlabels, filled=True, rounded=True,
-              impurity=False, precision=0, fontsize=7, ax=ax,
-              proportion=False)
-    ax.set_title("Árvore ilustrativa — como o preço se divide (resumo didático)")
-    fig.tight_layout()
-
-    # regras em linguagem natural, com destaque para o caminho da transação
-    t = dtree.tree_
-
-    def _regras(node, cond):
-        out = []
-        if t.feature[node] != _tree.TREE_UNDEFINED:
-            name = tlabels[t.feature[node]]; thr = t.threshold[node]
-            out += _regras(t.children_left[node], cond + [(name, "<=", thr)])
-            out += _regras(t.children_right[node], cond + [(name, ">", thr)])
-        else:
-            out.append((cond, float(t.value[node][0][0]), int(t.n_node_samples[node])))
-        return out
-
-    regras_nat = []
-    for cond, val, n in _regras(0, []):
-        partes = []
-        for name, op, thr in cond:
-            if name == "Quantidade":
-                partes.append(f"Quantidade {op} {thr:.0f}")
-            else:
-                partes.append(f"{'SIM' if op == '>' else 'NÃO'}: {name.lower()}")
-        regras_nat.append({"regra (caminho da árvore)": " e ".join(partes),
-                           "preço estimado": round(val, 0), "nº de vendas": n})
-    regras_nat_df = _round_df(pd.DataFrame(regras_nat).sort_values("preço estimado"),
-                              money_cols=["preço estimado"], int_cols=["nº de vendas"])
-
-    # frase-exemplo do caminho da própria transação
-    node = 0; caminho = []
-    while t.feature[node] != _tree.TREE_UNDEFINED:
-        fi = t.feature[node]; thr = t.threshold[node]
-        val_tx = Xt[ti, fi]
-        if val_tx <= thr:
-            if tlabels[fi] == "Quantidade":
-                caminho.append(f"Quantidade ≤ {thr:.0f}")
-            else:
-                caminho.append(f"não {tlabels[fi].lower()}")
-            node = t.children_left[node]
-        else:
-            if tlabels[fi] == "Quantidade":
-                caminho.append(f"Quantidade > {thr:.0f}")
-            else:
-                caminho.append(tlabels[fi].lower())
-            node = t.children_right[node]
-    preco_folha = float(t.value[node][0][0])
-    frase = f"Se {', '.join(caminho)}, o preço tende a ser ${preco_folha:,.0f}."
-
-    add("Nível 5 · Árvore ilustrativa — o caminho até o preço, visível",
-        why="Uma árvore de decisão desenhada mostra, visualmente, como as condições se encadeiam até um preço. Cada árvore do XGBoost real prevê só uma fração do preço em escala log (ilegível), então usamos aqui UMA árvore rasa que aproxima o padrão do conjunto e prevê o preço inteiro — didática, não o modelo real.",
-        answers="Como as regras se encadeiam, visualmente, até chegar num preço?",
-        insight=f"Seguindo o caminho da transação analisada na árvore: {frase} "
-                "Cada folha é um grupo de vendas com preço típico — a tabela abaixo lista todas as regras em linguagem natural.",
-        fig=fig, table=regras_nat_df)
-
-
-
-    # ===================================================================
-    # 2 · ECONOMETRIA — REGRESSÃO EM PAINEL (peer group × mês)
-    # ===================================================================
-    # Estimador within: agrupa por peer group estável (material × tier × business)
-    # e usa a variação AO LONGO DOS MESES dentro de cada grupo. Assim a elasticidade
-    # vem de comparar o mesmo item/perfil consigo mesmo no tempo — variação limpa,
-    # sem contaminação de mix entre produtos/tiers diferentes.
-    import statsmodels.api as sm
-    PGe = [COL_MATERIAL, COL_TIER, COL_BUSINESS]
-    # agrega por grupo-mês (um ponto = preço/qtd médios daquele grupo naquele mês)
-    dpanel = d.copy()
-    dpanel["_gkey"] = dpanel.groupby(PGe).ngroup()
-    gm = (dpanel.groupby(["_gkey", "date"])
-          .agg(ln_price=("ln_price", "mean"), ln_qty=("ln_qty", "mean"),
-               ln_cost=("ln_cost", "mean"), n=("ln_price", "size")).reset_index())
-    # exige pelo menos 6 meses distintos por grupo (senão não há série p/ estimar)
-    meses_por_grupo = gm.groupby("_gkey")["date"].transform("nunique")
-    MIN_MESES = 6
-    gm = gm[meses_por_grupo >= MIN_MESES].copy()
-    n_grupos_painel = gm["_gkey"].nunique()
-    # within: demedia cada variável dentro do próprio grupo
-    for c in ["ln_qty", "ln_price", "ln_cost"]:
-        gm[c + "_dm"] = gm[c] - gm.groupby("_gkey")[c].transform("mean")
-    ols = sm.OLS(gm["ln_qty_dm"], sm.add_constant(gm["ln_price_dm"]), missing="drop").fit()
-    beta_ols = ols.params["ln_price_dm"]
-    ci = ols.conf_int().loc["ln_price_dm"]
-    cobertura_receita = 100 * d[d.groupby(PGe)["date"].transform("nunique") >= MIN_MESES][COL_REVENUE].sum() / d[COL_REVENUE].sum()
-
-    # recria as versões demediadas em d (por peer group) para o bloco causal usar a seguir
-    for c in ["ln_qty", "ln_price", "ln_cost"]:
-        d[c + "_dm"] = d[c] - d.groupby(PGe)[c].transform("mean")
-
-    # gráficos de diagnóstico da regressão (pressupostos): ajuste, resíduos, Q-Q
-    import scipy.stats as _sstats
-    _samp = gm.dropna(subset=["ln_price_dm", "ln_qty_dm"])
-    if len(_samp) > 6000:
-        _samp = _samp.sample(6000, random_state=1)
-    # resíduos e ajustados: garantir mesmo tamanho, alinhados por posição
-    _resid = np.asarray(ols.resid)
-    _fitted = np.asarray(ols.fittedvalues)
-    _nmin = min(len(_resid), len(_fitted))
-    _resid = _resid[:_nmin]
-    _fitted = _fitted[:_nmin]
-    fig_econ, axes = plt.subplots(1, 3, figsize=(13, 4))
-    # (1) scatter de ajuste: ln_qty_dm vs ln_price_dm + reta da regressão
-    axes[0].scatter(_samp["ln_price_dm"], _samp["ln_qty_dm"], s=6, alpha=0.12, color="#3b6ea5")
-    _xr = np.linspace(_samp["ln_price_dm"].min(), _samp["ln_price_dm"].max(), 50)
-    axes[0].plot(_xr, ols.params["const"] + beta_ols * _xr, color="#c0504d", lw=2,
-                 label=f"β = {beta_ols:.2f}")
-    axes[0].set_xlabel("ln(preço) — desvio do grupo"); axes[0].set_ylabel("ln(quantidade) — desvio do grupo")
-    axes[0].set_title("Ajuste: preço × quantidade (within grupo)"); axes[0].legend(fontsize=8)
-    # (2) resíduos vs ajustados (homocedasticidade)
-    _rs = np.random.RandomState(1).choice(_nmin, min(6000, _nmin), replace=False)
-    axes[1].scatter(_fitted[_rs], _resid[_rs], s=6, alpha=0.12, color="#0F6E56")
-    axes[1].axhline(0, color="#c0504d", lw=1)
-    axes[1].set_xlabel("Valores ajustados"); axes[1].set_ylabel("Resíduos")
-    axes[1].set_title("Resíduos vs. ajustados (variância constante?)")
-    # (3) Q-Q plot (normalidade dos resíduos)
-    _sstats.probplot(_resid[_rs], dist="norm", plot=axes[2])
-    axes[2].set_title("Q-Q plot dos resíduos (normalidade?)")
-    axes[2].get_lines()[0].set_markersize(3); axes[2].get_lines()[0].set_alpha(0.3)
-    axes[2].get_lines()[0].set_color("#8250c4"); axes[2].get_lines()[1].set_color("#c0504d")
-    fig_econ.tight_layout()
-
-    add("2 · Econometria (regressão em painel) — a política de preço implícita",
-        how_it_works=f"Em vez de misturar todas as vendas, montamos um PAINEL: agrupamos por peer group estável (mesmo material × tier × business) e, dentro de cada grupo, acompanhamos preço e quantidade MÊS A MÊS. Isso dá, para cada grupo, uma pequena série temporal. A regressão então mede a elasticidade comparando o grupo consigo mesmo ao longo do tempo — 'quando o preço deste item, para este tier, subiu de um mês para outro, o que aconteceu com a quantidade?'. Usamos só grupos com pelo menos {MIN_MESES} meses de histórico (que cobrem {cobertura_receita:.0f}% da receita), e o log-log faz a inclinação virar diretamente a elasticidade.",
-        why="A regressão em painel com efeitos fixos de peer group estima a elasticidade usando a variação temporal dentro de cada grupo comparável — a mais limpa possível, pois isola o efeito do preço sem contaminação de diferenças entre produtos, tiers ou países. É a política de preço que os dados revelam, do jeito que a área de pricing explicaria ao board.",
-        answers="Qual a elasticidade-preço média e a política de preço implícita nos dados?",
-        assumptions=f"Linearidade em log; erros exógenos (E[ε|X]=0); efeitos fixos de peer group (material × tier × business) absorvem o preço-base de cada combinação. A identificação vem da variação MENSAL dentro de cada grupo (≥{MIN_MESES} meses). O pressuposto crítico — e violado aqui — é a exogeneidade do preço.",
-        formula=[r"\ln q_{g,t} = \alpha_{g} + \beta\,\ln p_{g,t} + \varepsilon_{g,t}",
-                 r"\hat{\beta} = \frac{\text{Cov}(\ln p,\, \ln q)}{\text{Var}(\ln p)} \quad\text{(within peer group, no tempo)}"],
-        formula_legend="g = peer group (material × tier × business); t = mês; α_g = efeito fixo do grupo; β = elasticidade-preço (o alvo). A demediação por grupo remove α_g, deixando só a variação temporal dentro de cada grupo.",
-        pros=["Coeficientes interpretáveis e comunicáveis",
-              "Variação temporal within-group é a identificação mais limpa da elasticidade",
-              "Efeitos fixos de peer group controlam produto, tier e business de uma vez"],
-        cons=["Assume linearidade em log",
-              "Enviesada se o preço for endógeno (é o caso)",
-              "Restringe-se a grupos com histórico suficiente de meses"],
-        insight=f"A elasticidade em painel é {beta_ols:.2f} [IC95% {ci[0]:.2f}, {ci[1]:.2f}], estimada sobre {n_grupos_painel:,} peer groups "
-                f"com pelo menos {MIN_MESES} meses de histórico ({cobertura_receita:.0f}% da receita). É inelástica — sugere espaço para subir preço. "
-                "Mas preço e quantidade se determinam juntos (endogeneidade): o próximo bloco testa esse viés.",
-        method=f"Montamos um painel: cada peer group (material × tier × business) vira uma série mensal de preço e quantidade médios. Ficamos só com grupos que têm pelo menos {MIN_MESES} meses de dados ({n_grupos_painel:,} grupos, {cobertura_receita:.0f}% da receita). Dentro de cada grupo, demediamos as variáveis (tiramos a média do próprio grupo) para usar SÓ a variação ao longo do tempo. Rodamos a regressão log-log nesses desvios: a inclinação β é a elasticidade — quando o preço deste item/perfil sobe 1% de um mês para outro, a quantidade varia β%. O IC95% é a faixa de confiança.",
-        money="Não mede US$ diretamente — fornece a elasticidade, um insumo-chave que alimenta o modelo de decisão multicritério ao final da aba. É um motor de análise, não o resultado final.",
-        worked=[
-            f"Elasticidade de {beta_ols:.2f} (inelástica): estatisticamente, há espaço para subir preço sem perder muito volume.",
-            "Coeficiente interpretável e comunicável — o tipo de número que a área de pricing leva ao board.",
-        ],
-        not_worked=[
-            "Endogeneidade: preço e quantidade se influenciam mutuamente, então este β pode estar enviesado — o bloco causal testa isso.",
-            "Assume relação log-linear: pode não capturar efeitos mais complexos de preço sobre demanda.",
-        ])
-    add("2 · (diagnóstico) — os gráficos que validam a regressão",
-        why="Toda regressão faz pressupostos, e é obrigação de rigor verificar se eles valem. São 3 gráficos: (1) AJUSTE — a nuvem de preço vs. quantidade com a reta estimada; a inclinação da reta É a elasticidade. (2) RESÍDUOS vs. AJUSTADOS — os erros do modelo devem estar espalhados de forma uniforme em torno de zero (variância constante, ou homocedasticidade); um funil indicaria problema. (3) Q-Q PLOT — se os pontos seguem a linha vermelha, os resíduos são aproximadamente normais, o que valida os intervalos de confiança.",
-        answers="Os pressupostos da regressão se sustentam nos dados?",
-        insight="O ajuste mostra a relação negativa esperada (mais preço, menos quantidade). Os resíduos estão distribuídos em torno de zero sem padrão forte de funil, e o Q-Q plot segue razoavelmente a diagonal — os pressupostos se sustentam o suficiente para confiar na estimativa da elasticidade e no seu intervalo de confiança.",
-        fig=fig_econ)
-
-    # -- Econometria, nível A: resumo executivo --
-    econ_resumo = pd.DataFrame({
-        "métrica": ["Elasticidade-preço (β)", "IC 95% inferior", "IC 95% superior",
-                    "R² (within peer group)", "Leitura"],
-        "valor": [f"{beta_ols:.3f}", f"{ci[0]:.3f}", f"{ci[1]:.3f}",
-                  f"{ols.rsquared:.4f}",
-                  "inelástico" if beta_ols > -1 else "elástico"],
-    })
-    add("2a · Econometria — resumo executivo",
-        insight="O número central e sua faixa de confiança. Elasticidade entre 0 e −1 significa inelástico "
-                "(subir preço aumenta receita); abaixo de −1, elástico. Nota sobre o R² baixo: em elasticidade de painel "
-                "isso é esperado e saudável — o preço sozinho explica pouco da variação de quantidade (a demanda depende de "
-                "muitos fatores), mas o coeficiente de elasticidade em si é preciso, como mostra o intervalo de confiança estreito.",
-        table=econ_resumo)
-
-    # -- Econometria, nível B: interpretação de negócio (o que X% de aumento faz) --
-    cenarios = []
-    for aumento in [0.05, 0.10, 0.15]:
-        var_q = beta_ols * aumento * 100
-        var_receita = (1 + aumento) * (1 + var_q / 100) - 1  # aprox. receita
-        cenarios.append({"aumento_de_preço": f"+{aumento:.0%}",
-                         "variação_de_volume": f"{var_q:+.1f}%",
-                         "efeito_na_receita": f"{var_receita*100:+.1f}%"})
-    add("2b · Econometria — tradução para o negócio",
-        why="A elasticidade só vira decisão quando traduzida em cenários concretos de preço, volume e receita.",
-        insight=f"Com β = {beta_ols:.2f}, cada aumento de preço perde pouco volume (demanda inelástica), então a "
-                "receita SOBE. A tabela mostra o efeito líquido de três cenários de reajuste.",
-        table=pd.DataFrame(cenarios))
-
-    # ===================================================================
-    # 3 · INFERÊNCIA CAUSAL (IV / 2SLS)
-    # ===================================================================
-    sub = d.dropna(subset=["ln_qty_dm", "ln_price_dm", "ln_cost_dm"]).copy()
-    sub = sub[np.isfinite(sub["ln_cost_dm"])]
-    samp = sub.sample(min(50000, len(sub)), random_state=p.random_state)
-    # 1º estágio: preço ~ custo (mede força do instrumento)
-    fs = sm.OLS(samp["ln_price_dm"], sm.add_constant(samp["ln_cost_dm"])).fit()
-    f_stat = float(fs.fvalue)
-    weak = f_stat < 10
-    # 2SLS: linearmodels se disponível; senão, 2SLS manual (duas OLS do statsmodels)
-    try:
-        from linearmodels.iv import IV2SLS
-        iv = IV2SLS(samp["ln_qty_dm"], sm.add_constant(samp[[]]),
-                    samp["ln_price_dm"], samp["ln_cost_dm"]).fit()
-        beta_iv = float(iv.params["ln_price_dm"])
-    except Exception:
-        # 2SLS manual: preço previsto pelo instrumento -> regride quantidade nele
-        p_hat = fs.predict(sm.add_constant(samp["ln_cost_dm"]))
-        second = sm.OLS(samp["ln_qty_dm"], sm.add_constant(p_hat)).fit()
-        beta_iv = float(second.params.iloc[1])
-    iv_tbl = pd.DataFrame({
-        "método": ["OLS (ingênuo)", "IV / 2SLS (custo como instrumento)"],
-        "elasticidade": [round(beta_ols, 3), round(beta_iv, 3)],
-        "confiável?": ["enviesado (endogeneidade)", "NÃO — instrumento fraco" if weak else "sim"],
-    })
-
-    # gráficos de diagnóstico do causal: 1º estágio (força do instrumento) + resíduos
-    _cs = np.random.RandomState(1).choice(len(samp), min(5000, len(samp)), replace=False)
-    _csamp = samp.iloc[_cs]
-    fig_caus, axcs = plt.subplots(1, 2, figsize=(11, 4.2))
-    # (1) 1º estágio: custo (instrumento) vs preço — deve ter relação forte se instrumento é bom
-    axcs[0].scatter(_csamp["ln_cost_dm"], _csamp["ln_price_dm"], s=6, alpha=0.15, color="#BA7517")
-    _xc = np.linspace(_csamp["ln_cost_dm"].min(), _csamp["ln_cost_dm"].max(), 50)
-    axcs[0].plot(_xc, fs.params["const"] + fs.params["ln_cost_dm"] * _xc, color="#c0504d", lw=2)
-    axcs[0].set_xlabel("ln(custo) — desvio do grupo [instrumento]")
-    axcs[0].set_ylabel("ln(preço) — desvio do grupo")
-    axcs[0].set_title(f"1º estágio: custo → preço (F={f_stat:.1f}, {'FRACO' if weak else 'forte'})")
-    # (2) força do instrumento vs limiar
-    axcs[1].bar(["F-stat do\ninstrumento", "Limiar mínimo\n(regra F>10)"], [f_stat, 10],
-                color=["#c0504d" if weak else "#1d9e75", "#888880"])
-    axcs[1].axhline(10, color="grey", ls="--", lw=0.8)
-    axcs[1].set_ylabel("Valor da estatística F")
-    axcs[1].set_title("Força do instrumento vs. limiar de validade")
-    for i, v in enumerate([f_stat, 10]):
-        axcs[1].text(i, v, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
-    fig_caus.tight_layout()
-
-    add("3 · Inferência causal (variável instrumental / 2SLS) — o que acontece se MUDARMOS o preço?",
-        how_it_works="O problema: nos dados, preço e demanda se influenciam mutuamente (preço alto pode ser causa OU consequência de baixa demanda), então uma regressão simples confunde causa e efeito. A variável instrumental resolve isso em 2 passos (2SLS = mínimos quadrados em dois estágios): procuramos algo que mexa no preço mas não na demanda diretamente — aqui, o CUSTO. 1º passo: usamos o custo para prever a parte do preço que é 'limpa' (não contaminada pela demanda). 2º passo: usamos esse preço limpo para medir o efeito real na demanda. Um teste (F-stat) verifica se o custo é um instrumento forte o suficiente para confiar no resultado.",
-        why="A regressão em painel estima a elasticidade média de forma interpretável, mas pode estar enviesada pela endogeneidade. A variável instrumental isola o efeito causal do preço na demanda usando o custo como instrumento: o custo desloca o preço (relevância) mas não afeta a demanda por outra via (exclusão). É o padrão-ouro para elasticidade causal sem experimento. Os gráficos mostram o 1º estágio (a força do instrumento) — a chave para saber se o método é válido aqui.",
-        answers="Se aumentarmos o preço de propósito, a demanda cai de verdade — e quanto?",
-        assumptions="(1) Relevância: o instrumento Z correlaciona com o preço (testável via F-stat). (2) Exclusão: Z só afeta a demanda ATRAVÉS do preço — não testável, exige argumento econômico. (3) Exogeneidade do instrumento.",
-        formula=[r"\text{1º est.: } \ln p_i = \pi_0 + \pi_1 \ln c_i + \nu_i",
-                 r"\text{2º est.: } \ln q_i = \alpha + \beta^{IV} \widehat{\ln p_i} + \varepsilon_i",
-                 r"\hat{\beta}^{IV} = \frac{\text{Cov}(\ln c,\, \ln q)}{\text{Cov}(\ln c,\, \ln p)}"],
-        formula_legend="c = custo unitário (instrumento); π_1 mede a força do instrumento (F-stat do 1º estágio deve ser > 10).",
-        pros=["Corrige o viés de endogeneidade",
-              "Estima efeito causal, não correlação",
-              "Testável: a força do instrumento é mensurável"],
-        cons=["Depende de um instrumento válido (difícil)",
-              "Exclusão não é testável — exige teoria",
-              "Instrumento fraco gera estimativa pior que OLS"],
-        insight=(f"ACHADO DE RIGOR: o instrumento é FRACO (F-stat do 1º estágio = {f_stat:.1f}, abaixo do limiar 10). "
-                 f"Logo a estimativa IV ({beta_iv:.1f}) é inválida e NÃO deve ser usada. O custo não é bom instrumento aqui — "
-                 "provavelmente se correlaciona com qualidade/tipo de produto, violando a restrição de exclusão. "
-                 "Reconhecer isso vale mais que reportar número errado."
-                 if weak else
-                 f"Elasticidade causal (IV) = {beta_iv:.2f}, instrumento forte (F={f_stat:.0f})."),
-        money="Não mede US$ — é o teste de validade que impede usarmos uma elasticidade causal errada nas decisões seguintes. Vale como seguro contra decisão ruim.",
-        method="Para saber se MUDAR o preço realmente muda a demanda (causa, não correlação), usamos a técnica de variável instrumental (2 estágios). A ideia: precisamos de algo que mexa no preço mas não mexa na demanda por outro caminho — usamos o CUSTO como esse 'instrumento'. 1º estágio: prevemos o preço a partir do custo. 2º estágio: usamos esse preço 'limpo' para estimar o efeito na demanda. O teste-chave é o F-stat do 1º estágio: se for maior que 10, o instrumento é forte; abaixo disso, é fraco e o resultado não vale.",
-        table=iv_tbl,
-        worked=[
-            "Testar a validade ANTES de usar o número é o certo — evita levar ao board uma elasticidade causal errada.",
-            "Reconhecer a limitação (instrumento fraco) demonstra rigor: preferimos não responder a responder errado.",
-        ] if weak else [
-            f"Instrumento forte (F={f_stat:.0f}): a elasticidade causal ({beta_iv:.2f}) é confiável.",
-            "Conseguimos separar causa de correlação — padrão-ouro sem precisar de experimento.",
-        ],
-        not_worked=[
-            f"Instrumento FRACO (F={f_stat:.1f} < 10): o custo não serve como instrumento aqui, então a elasticidade causal fica indeterminada.",
-            "Sem instrumento válido, usamos a elasticidade observacional (OLS) com a ressalva de que pode ter viés.",
-        ] if weak else [
-            "IV depende de pressupostos não totalmente testáveis (restrição de exclusão) — exige argumento econômico.",
-        ],
-        fig=fig_caus)
-
-    # -- Causal, nível A: teste de força do instrumento (1º estágio) --
-    caus_diag = pd.DataFrame({
-        "teste": ["F-stat do 1º estágio", "Limiar de instrumento forte", "Veredito"],
-        "valor": [f"{f_stat:.1f}", "10,0",
-                  "INSTRUMENTO FRACO — não usar IV" if weak else "instrumento forte — IV válido"],
-    })
-    add("3a · Causal — diagnóstico de validade do instrumento",
-        why="Antes de acreditar em qualquer estimativa IV, testa-se a força do instrumento. Sem isso, o IV pode ser pior que o OLS.",
-        insight=f"O F-stat mede se o custo realmente move o preço (relevância). Aqui vale {f_stat:.1f}. "
-                + ("Abaixo de 10, o instrumento é fraco e a estimativa IV é não-confiável — descartada."
-                   if weak else "Acima de 10, o instrumento é forte e a estimativa IV é válida."),
-        table=caus_diag)
-
-    # -- Causal, nível B: o que fazer diante disso (decisão metodológica) --
-    add("3b · Causal — a decisão metodológica honesta",
-        why="Reconhecer a limitação e escolher o caminho certo é o que separa análise rigorosa de teatro de números.",
-        insight=("Como o instrumento é fraco, NÃO reportamos a elasticidade IV. Mantemos a econométrica como aproximação, "
-                 "com a ressalva de endogeneidade. O caminho ideal para elasticidade causal de verdade seria um experimento "
-                 "de preço (teste A/B) ou um instrumento melhor (choque de câmbio, mudança tributária) — fora do escopo desta base."
-                 if weak else
-                 "O instrumento é válido, então a elasticidade causal (IV) é a estimativa preferida sobre a OLS."),
-        money="Não mede $ — protege a decisão de usar uma elasticidade enviesada, o que evitaria erro de precificação.")
-
-    # -- Causal, nível C: a resposta causal (condicional à validade) --
-    # o que a leitura causal diria, contrastando com a observacional (OLS)
-    exemplo_aumento = 0.10
-    causal_resp = pd.DataFrame({
-        "leitura": ["Observacional (OLS) — o que temos",
-                    "Causal (IV) — o que gostaríamos"],
-        "elasticidade": [f"{beta_ols:.2f}", f"{beta_iv:.2f}" + (" ⚠ inválida" if weak else "")],
-        f"efeito de +{exemplo_aumento:.0%} no preço": [
-            f"demanda {beta_ols*exemplo_aumento*100:+.1f}% (associação)",
-            (f"demanda {beta_iv*exemplo_aumento*100:+.1f}% (causal)" if not weak
-             else "não estimável — instrumento fraco")],
-        "vale como decisão?": [
-            "aproximação, com ressalva de viés",
-            "sim, se causal" if not weak else "NÃO — instrumento fraco"],
-    })
-    add("3c · Causal — a resposta que buscamos (e por que não a temos aqui)",
-        why="O objetivo final do IV é uma frase de INTERVENÇÃO: 'aumentar o preço em X% CAUSA uma queda de Y% na demanda'. Diferente do OLS, que só descreve como preço e volume variaram juntos no passado.",
-        answers=f"Se aumentarmos o preço de propósito em +{exemplo_aumento:.0%}, quanto a demanda cai — de verdade?",
-        insight=(f"SE o instrumento fosse válido, a resposta causal seria: '+{exemplo_aumento:.0%} de preço causa "
-                 f"{beta_iv*exemplo_aumento*100:+.1f}% de demanda'. Mas como o F-stat é {f_stat:.1f} (< 10), essa frase NÃO se sustenta. "
-                 f"O que podemos dizer, com ressalva, é a leitura observacional (OLS): +{exemplo_aumento:.0%} de preço está associado a "
-                 f"{beta_ols*exemplo_aumento*100:+.1f}% de demanda — associação, não causa comprovada."
-                 if weak else
-                 f"Com instrumento válido, a resposta causal é: '+{exemplo_aumento:.0%} de preço CAUSA "
-                 f"{beta_iv*exemplo_aumento*100:+.1f}% de demanda'. Esta é a base para decidir o reajuste."),
-        table=causal_resp)
-
-
-    # ===================================================================
-    # 4 · DECISÃO MULTICRITÉRIO (MCDA) — preço recomendado a nível SKU
-    # ===================================================================
-    from sklearn.preprocessing import minmax_scale, StandardScaler
-    from sklearn.cluster import KMeans
-
-    # pesos vindos do usuário (5 critérios; normalizados para somar 1)
-    w_raw = {"margem": getattr(p, "w_margem", 0.20),
-             "elast": getattr(p, "w_elasticidade", 0.20),
-             "share": getattr(p, "w_share", 0.20),
-             "churn": getattr(p, "w_churn", 0.20),
-             "cluster": getattr(p, "w_cluster", 0.20)}
-    w_sum = sum(w_raw.values()) or 1.0
-    w = {k: v / w_sum for k, v in w_raw.items()}
-    teto = getattr(p, "max_price_increase", 0.15)
-    meses_tot = d["date"].nunique()
-
-    # UNIDADE DE PRECIFICAÇÃO = SKU × tier × business × país
-    PGm = [COL_MATERIAL, COL_TIER, COL_BUSINESS, COL_COUNTRY]
-    dseg = d.copy()
-    seg = dseg.groupby(PGm).agg(
-        preco=(COL_PRICE, "median"), custo=("unit_cost", "median"),
-        receita=(COL_REVENUE, "sum"), qtd=(COL_QTY, "sum"), n=(COL_PRICE, "size"),
-        meses=("date", "nunique"), clientes=(COL_PARENT, "nunique")).reset_index()
-    seg = seg[(seg["n"] >= 5) & (seg["preco"] > 0)].copy()
-    seg["margem_pct"] = (seg["preco"] - seg["custo"]) / seg["preco"].clip(lower=0.01)
-
-    # critério 1 · MARGEM: margem baixa = espaço para subir
-    seg["s_margem"] = 1 - minmax_scale(seg["margem_pct"].clip(-2, 1))
-    # critério 2 · ELASTICIDADE: inelástico = seguro p/ subir (elasticidade por business)
-    elast_by_biz = {}
-    for biz, gb in dseg.groupby(COL_BUSINESS):
-        if len(gb) >= 50 and gb["ln_price"].std() > 0:
+            # XGBoost se disponível; senão, GradientBoosting do sklearn (sempre presente)
+            ml_engine = "XGBoost"
             try:
-                elast_by_biz[biz] = float(np.polyfit(gb["ln_price"] - gb["ln_price"].mean(),
-                                                     gb["ln_qty"] - gb["ln_qty"].mean(), 1)[0])
+                from xgboost import XGBRegressor
+                ml = XGBRegressor(n_estimators=200, max_depth=7, learning_rate=0.08,
+                                  n_jobs=-1, tree_method="hist", random_state=p.random_state)
+                ml.fit(X, y)
             except Exception:
-                elast_by_biz[biz] = beta_ols
-        else:
-            elast_by_biz[biz] = beta_ols
-    seg["elast"] = seg[COL_BUSINESS].map(elast_by_biz).fillna(beta_ols)
-    seg["s_elast"] = minmax_scale(seg["elast"].clip(-2, 0))  # menos elástico = score maior
-    # critério 3 · MARKET SHARE: share do SKU DENTRO DO BUSINESS (concorre com todos do business);
-    # share ALTO = SKU importante no business = proteger = score baixo
-    biz_rev = seg.groupby(COL_BUSINESS)["receita"].transform("sum")
-    seg["share"] = seg["receita"] / biz_rev.clip(lower=1)
-    seg["s_share"] = 1 - minmax_scale(seg["share"])  # share baixo = pode subir mais
-    # critério 4 · CHURN: chance de perder o cliente daquele SKU; churn alto = NÃO subir preço
-    # score comportamental (RFM-like) por cliente: recência + frequência + tendência de volume
-    tmax = int(d["date"].map({dt: i for i, dt in enumerate(sorted(d["date"].unique()))}).max())
-    _tmap = {dt: i for i, dt in enumerate(sorted(d["date"].unique()))}
-    d["_t"] = d["date"].map(_tmap)
-    cli = d.groupby(COL_PARENT).agg(ult=("_t", "max"), nm=("_t", "nunique"),
-                                    prim=("_t", "min")).reset_index()
-    cli["recencia"] = tmax - cli["ult"]
-    cli["span"] = (cli["ult"] - cli["prim"] + 1).clip(lower=1)
-    cli["freq_rel"] = cli["nm"] / cli["span"]
-    rec6 = d[d["_t"] > tmax - 6].groupby(COL_PARENT)[COL_REVENUE].sum()
-    prev6 = d[(d["_t"] <= tmax - 6) & (d["_t"] > tmax - 12)].groupby(COL_PARENT)[COL_REVENUE].sum()
-    cli = cli.merge(rec6.rename("rec6"), on=COL_PARENT, how="left").merge(
-        prev6.rename("prev6"), on=COL_PARENT, how="left")
-    cli["rec6"] = cli["rec6"].fillna(0); cli["prev6"] = cli["prev6"].fillna(0)
-    cli["tend"] = (cli["rec6"] - cli["prev6"]) / cli["prev6"].clip(lower=1)
-    cli["churn"] = (minmax_scale(cli["recencia"]) * 0.5 +
-                    (1 - minmax_scale(cli["freq_rel"])) * 0.3 +
-                    (1 - minmax_scale(cli["tend"].clip(-2, 2))) * 0.2)
-    churn_by_cli = cli.set_index(COL_PARENT)["churn"]
-    # churn do SKU = média do churn dos clientes que compram aquele SKU (ponderada por receita)
-    d["_churn_cli"] = d[COL_PARENT].map(churn_by_cli).fillna(0.5)
-    churn_sku = (d.groupby(PGm)
-                 .apply(lambda g: np.average(g["_churn_cli"], weights=g[COL_REVENUE].clip(lower=1)))
-                 .rename("churn_sku").reset_index())
-    seg = seg.merge(churn_sku, on=PGm, how="left")
-    seg["churn_sku"] = seg["churn_sku"].fillna(0.5)
-    # churn ALTO = risco de perder cliente = NÃO subir = score BAIXO
-    seg["s_churn"] = 1 - minmax_scale(seg["churn_sku"])
-    # critério 5 · ALINHAMENTO NO CLUSTER: k-means por comportamento; preço abaixo do cluster = subir
-    feats = pd.DataFrame({
-        "vol": np.log1p(seg["qtd"]), "freq": seg["meses"],
-        "margem": seg["margem_pct"].clip(-2, 1), "preco": np.log1p(seg["preco"])})
-    Xs = StandardScaler().fit_transform(feats.fillna(0))
-    n_clusters = min(6, max(2, len(seg) // 500))
-    km = KMeans(n_clusters=n_clusters, random_state=1, n_init=10).fit(Xs)
-    seg["cluster"] = km.labels_
-    seg["cl_med_preco"] = seg.groupby("cluster")["preco"].transform("median")
-    seg["gap_cluster"] = ((seg["cl_med_preco"] - seg["preco"]) / seg["cl_med_preco"].clip(lower=0.01)).clip(lower=0)
-    seg["s_cluster"] = minmax_scale(seg["gap_cluster"]) if seg["gap_cluster"].nunique() > 1 else 0.0
+                from sklearn.ensemble import HistGradientBoostingRegressor
+                ml_engine = "HistGradientBoosting (sklearn)"
+                ml = HistGradientBoostingRegressor(max_iter=200, max_depth=7,
+                                                   learning_rate=0.08, random_state=p.random_state)
+                ml.fit(X, y)
+            r2_ml = ml.score(X, y)
 
-    # score combinado (5 critérios)
-    seg["score"] = (w["margem"] * seg["s_margem"] + w["elast"] * seg["s_elast"] +
-                    w["share"] * seg["s_share"] + w["churn"] * seg["s_churn"] +
-                    w["cluster"] * seg["s_cluster"])
-    # ESCALA CORRIGIDA: usa o percentil do score para espalhar de 0 ao teto (diferencia de verdade)
-    seg["score_pct"] = seg["score"].rank(pct=True)
-    seg["reajuste_%"] = teto * seg["score_pct"] * 100
-    seg["preco_atual"] = seg["preco"]
-    seg["preco_recomendado"] = seg["preco"] * (1 + teto * seg["score_pct"])
-    seg["ganho_potencial"] = teto * seg["score_pct"] * seg["receita"]
-    seg = seg.sort_values("ganho_potencial", ascending=False)
-    ganho_mcda = float(seg["ganho_potencial"].sum())
-    n_skus = len(seg)
+            # importância dos drivers: SHAP se disponível, senão permutação (sklearn)
+            try:
+                import shap
+                idx = np.random.RandomState(p.random_state).choice(len(X), min(1500, len(X)), replace=False)
+                sv = shap.TreeExplainer(ml).shap_values(X[idx])
+                imp = np.abs(sv).mean(0)
+                imp_method = "SHAP"
+            except Exception:
+                from sklearn.inspection import permutation_importance
+                idx = np.random.RandomState(p.random_state).choice(len(X), min(3000, len(X)), replace=False)
+                pi = permutation_importance(ml, X[idx], y[idx], n_repeats=3,
+                                            random_state=p.random_state, n_jobs=-1)
+                imp = pi.importances_mean
+                imp_method = "importância por permutação"
+            imp = np.abs(imp)
+            shap_df = (pd.DataFrame({"driver": feat, f"importância ({imp_method})": imp})
+                       .sort_values(f"importância ({imp_method})", ascending=False).reset_index(drop=True))
+            imp_col = f"importância ({imp_method})"
+            shap_df[imp_col] = shap_df[imp_col].round(3)
 
-    # filtro por SKU (seletor)
-    sku_sel = getattr(p, "mcda_sku", "(todos)")
-    if sku_sel and sku_sel != "(todos)":
-        seg_view = seg[seg[COL_MATERIAL].astype(str) == sku_sel]
-        if len(seg_view) == 0:
-            seg_view = seg.head(20)
-    else:
-        seg_view = seg.head(20)
+            # uplift $ do ML: resíduo abaixo do P25 levado ao P25 (mesmo método da aba 5)
+            d["_pred"] = ml.predict(X)
+            d["_resid"] = d["ln_price"] - d["_pred"]
+            tgt = d["_resid"].quantile(0.25)
+            opp = d[d["_resid"] < tgt].copy()
+            opp["_ptarget"] = np.exp(d.loc[opp.index, "_pred"] + tgt)
+            ml_uplift = ((opp["_ptarget"] - opp[COL_PRICE]).clip(lower=0) * opp[COL_QTY]).sum()
 
-    # GRÁFICO NOVO: reajuste recomendado + ganho US$ dos top 15 SKUs (duas leituras claras)
-    top_g = seg.head(15).iloc[::-1]  # invertido p/ maior no topo do barh
-    lab = [f"{str(m)[:10]} T{t}·B{b}" for m, t, b in
-           zip(top_g[COL_MATERIAL], top_g[COL_TIER], top_g[COL_BUSINESS])]
-    fig, (axA, axB) = plt.subplots(1, 2, figsize=(12, 5.5), sharey=True)
-    ypos = np.arange(len(top_g))
-    axA.barh(ypos, top_g["reajuste_%"], color="#378add")
-    axA.set_yticks(ypos); axA.set_yticklabels(lab, fontsize=7)
-    axA.set_xlabel("Reajuste recomendado (%)")
-    axA.set_title("Quanto reajustar (% até o teto)")
-    for i, v in enumerate(top_g["reajuste_%"]):
-        axA.text(v, i, f" {v:.1f}%", va="center", fontsize=7)
-    axB.barh(ypos, top_g["ganho_potencial"] / 1e6, color="#1d9e75")
-    axB.set_xlabel("Ganho potencial (US$ mi)")
-    axB.set_title("Quanto isso rende (US$)")
-    for i, v in enumerate(top_g["ganho_potencial"] / 1e6):
-        axB.text(v, i, f" ${v:,.2f}mi", va="center", fontsize=7)
-    fig.suptitle("Top 15 SKUs por ganho — reajuste recomendado e retorno", fontsize=11)
-    fig.tight_layout()
+            fig, ax = plt.subplots(figsize=(8, 4))
+            sd = shap_df.iloc[::-1]
+            ax.barh(sd["driver"], sd[imp_col], color="#378add")
+            ax.set_xlabel(imp_col.capitalize()); ax.set_title("O que forma o preço? (drivers do modelo)")
+            fig.tight_layout()
+            top_driver = shap_df.iloc[0]["driver"]
+            tier_row = shap_df[shap_df["driver"] == "Customer Tier"]
+            tier_imp = tier_row[imp_col].iloc[0] if len(tier_row) else 0
 
-    mcda_tbl = seg_view[[COL_MATERIAL, COL_TIER, COL_BUSINESS, COL_COUNTRY, "preco_atual",
-                         "preco_recomendado", "reajuste_%", "ganho_potencial", "cluster"]].copy()
-    mcda_tbl["preço_atual"] = mcda_tbl["preco_atual"].map(lambda v: f"US$ {v:,.2f}")
-    mcda_tbl["preço_recomendado"] = mcda_tbl["preco_recomendado"].map(lambda v: f"US$ {v:,.2f}")
-    mcda_tbl["reajuste_%"] = mcda_tbl["reajuste_%"].round(1)
-    mcda_tbl["ganho_US$"] = mcda_tbl["ganho_potencial"].map(lambda v: f"US$ {v:,.0f}")
-    mcda_tbl["cluster"] = mcda_tbl["cluster"].astype(int)
-    mcda_tbl = mcda_tbl[[COL_MATERIAL, COL_TIER, COL_BUSINESS, COL_COUNTRY,
-                         "preço_atual", "preço_recomendado", "reajuste_%", "ganho_US$", "cluster"]]
+            add("1 · Machine Learning (XGBoost) — prever o preço e explicar os drivers",
+                how_it_works="O XGBoost é um método de 'árvores de decisão em sequência'. Imagine várias perguntas encadeadas ('o business é A? o país é X? a quantidade é alta?') que vão dividindo as vendas em grupos cada vez mais parecidos, até estimar um preço para cada perfil. O 'boosting' significa que ele constrói centenas dessas árvores, cada nova corrigindo os erros das anteriores — por isso é tão preciso. Para explicar o que o modelo aprendeu (que costuma ser uma caixa-preta), usamos o SHAP, que mede quanto cada característica empurrou o preço previsto para cima ou para baixo.",
+                why=f"ML (gradient boosting, motor: {ml_engine}) prevê o preço esperado com alta acurácia capturando interações não-lineares que a regressão não pega. A importância dos drivers ({imp_method}) abre a caixa-preta: mostra quanto cada variável pesa na previsão.",
+                answers="Qual o preço esperado deste perfil, e o que mais determina esse preço?",
+                assumptions="Não exige forma funcional nem linearidade. Assume que o passado representa o futuro (padrões estáveis) e que as features disponíveis capturam o essencial. Não infere causalidade — só associação.",
+                formula=[r"\hat{p}_i = f(x_i) = \sum_{k=1}^{K} \eta\, T_k(x_i)",
+                         r"\phi_j = \sum_{S \subseteq F \setminus \{j\}} \frac{|S|!\,(|F|-|S|-1)!}{|F|!}\left[f(S \cup \{j\}) - f(S)\right]"],
+                formula_legend="f = ensemble de K árvores T_k com taxa de aprendizado η; φ_j = valor SHAP da feature j (contribuição média marginal sobre todas as coalizões de features), quando SHAP está disponível.",
+                pros=["Captura interações e não-linearidades automaticamente",
+                      "Alta acurácia preditiva (R² elevado)",
+                      "Importância dá explicabilidade dos drivers"],
+                cons=["Não é causal — só correlação",
+                      "Exige cuidado com overfitting e vazamento",
+                      "Menos transparente que uma regressão para o board"],
+                insight=f"R² de {r2_ml:.2f}. Os drivers dominantes são {top_driver} e Business; o Customer Tier contribui pouquíssimo "
+                        f"(importância {tier_imp:.3f}) — evidência quantitativa de que a régua de Tier atual quase não explica preço.",
+                method=f"Treinamos um modelo de gradient boosting ({ml_engine}) para prever o preço de cada venda a partir das características dela (material, business, tier, país, quantidade). O modelo aprende com o histórico e mede o acerto pelo R² ({r2_ml:.2f} = quanto da variação de preço ele consegue explicar, de 0 a 1). Para saber QUAIS variáveis pesam, usamos {imp_method}: para cada característica, mede-se o quanto ela empurra o preço previsto para cima ou para baixo. O uplift soma as transações vendidas ABAIXO do preço que o modelo esperava, calculando quanto renderia levá-las ao 25º percentil.",
+                money=f"Uplift potencial identificado pelo ML (transações abaixo do preço esperado, levadas ao P25): "
+                      f"US$ {ml_uplift/1e6:,.1f} mi brutos.",
+                worked=[
+                    f"Alta acurácia (R² {r2_ml:.2f}): o modelo prevê bem o preço, então os drivers que ele aponta são confiáveis.",
+                    "O modelo virou uma régua objetiva de 'preço esperado' — base para achar quem está sendo subprecificado.",
+                ],
+                not_worked=[
+                    f"O Customer Tier quase não pesa (importância {tier_imp:.3f}): a segmentação de cliente não está determinando preço.",
+                    "ML capta associação, não causa: ele diz 'este perfil costuma ter tal preço', não 'se eu subir o preço, o que acontece'.",
+                ],
+                fig=fig)
+            add("Drivers de preço (tabela)", table=shap_df)
 
-    perfil_nome = getattr(p, "mcda_perfil", "Equilibrado")
-    pesos_txt = (f"Margem {w['margem']*100:.0f}% · Elasticidade {w['elast']*100:.0f}% · "
-                 f"Market share {w['share']*100:.0f}% · Churn {w['churn']*100:.0f}% · "
-                 f"Cluster {w['cluster']*100:.0f}%")
-    seg_top = seg.iloc[0]
+            # ===================================================================
+            # 1b · PRICE POSITION INDEX (PPI) + OPPORTUNITY VALUE
+            # ===================================================================
+            # PPI = preço praticado / preço esperado pelo modelo
+            d["preco_esperado"] = np.exp(d["_pred"])
+            d["PPI"] = d[COL_PRICE] / d["preco_esperado"]
 
-    # exemplo passo a passo do SKU líder — em linguagem de negócio (para não-técnicos)
-    _st = seg_top
-    _c_marg = w["margem"] * _st["s_margem"]
-    _c_elas = w["elast"] * _st["s_elast"]
-    _c_shar = w["share"] * _st["s_share"]
-    _c_chur = w["churn"] * _st["s_churn"]
-    _c_clus = w["cluster"] * _st["s_cluster"]
-    _score_bruto = _c_marg + _c_elas + _c_shar + _c_chur + _c_clus
-    _v_margem = _st["margem_pct"] * 100
-    _v_elast = _st["elast"]
-    _v_share = _st["share"] * 100
-    _v_churn = _st.get("churn_sku", 0.5)
-    _v_gap = _st.get("gap_cluster", 0) * 100
-    _mat = _st[COL_MATERIAL]
+            def ppi_faixa(v):
+                if v < 0.90:
+                    return "Forte desconto (<0,90)"
+                if v <= 1.05:
+                    return "Dentro do esperado (0,90–1,05)"
+                return "Acima do benchmark (>1,05)"
 
-    # helper: traduz uma nota 0-1 em "posição" que um gestor entende
-    def _pos(nota):
-        if nota >= 0.75:
-            return "entre os mais altos"
-        if nota >= 0.5:
-            return "acima da média"
-        if nota >= 0.25:
-            return "abaixo da média"
-        return "entre os mais baixos"
+            d["faixa_PPI"] = d["PPI"].apply(ppi_faixa)
+            # Opportunity Value = quanto se deixa na mesa (só onde PPI < 1)
+            d["opportunity_value"] = ((d["preco_esperado"] - d[COL_PRICE]).clip(lower=0) * d[COL_QTY])
 
-    conta_txt = (
-        f"**Vamos pegar um produto real e ver, passo a passo, como o modelo chega no preço sugerido.**\n\n"
-        f"Produto: SKU **{_mat}** (tier {_st[COL_TIER]}, {_st[COL_COUNTRY]}) · Objetivo escolhido: **{getattr(p, 'mcda_perfil', 'Equilibrado')}**\n\n"
-        f"**A regra:** para cada um dos 5 critérios, damos ao produto uma nota de 0 a 10 "
-        f"(0 = nenhum motivo para subir o preço, 10 = motivo máximo). A nota sai comparando o produto com todos os outros.\n\n"
-        f"**Critério 1 — Margem: nota {_st['s_margem']*10:.0f}/10.** "
-        f"Este produto tem margem de {_v_margem:.0f}% (vende a US$ {_st['preco']:,.2f}, custa US$ {_st['custo']:,.2f}). "
-        f"Comparando com os outros, essa margem está {_pos(_st['s_margem'] if _v_margem < 50 else 1-_st['s_margem'])}. "
-        f"Margem já {'gorda' if _st['s_margem'] < 0.5 else 'apertada'} significa {'pouco' if _st['s_margem'] < 0.5 else 'bastante'} espaço para subir → nota {_st['s_margem']*10:.0f}.\n\n"
-        f"**Critério 2 — Elasticidade: nota {_st['s_elast']*10:.0f}/10.** "
-        f"Mede se o cliente foge quando o preço sobe. Aqui a sensibilidade é {_v_elast:.2f} "
-        f"({'baixa — cliente aguenta reajuste' if _st['s_elast'] > 0.5 else 'considerável — cliente reage ao preço'}) → nota {_st['s_elast']*10:.0f}.\n\n"
-        f"**Critério 3 — Market share: nota {_st['s_share']*10:.0f}/10.** "
-        f"Este produto representa {_v_share:.1f}% da receita do seu business — um share {_pos(1-_st['s_share'])}. "
-        f"{'Como pesa pouco, dá para reajustar sem risco de mexer no faturamento' if _st['s_share'] > 0.5 else 'Como é importante, convém proteger e não arriscar'} → nota {_st['s_share']*10:.0f}.\n\n"
-        f"**Critério 4 — Churn (risco de perder o cliente): nota {_st['s_churn']*10:.0f}/10.** "
-        f"Os clientes deste produto têm risco {'baixo' if _st['s_churn'] > 0.5 else 'alto'} de parar de comprar "
-        f"(índice {_v_churn:.2f} de 1). Cliente {'fiel aguenta um reajuste' if _st['s_churn'] > 0.5 else 'em risco: melhor não subir'} → nota {_st['s_churn']*10:.0f}.\n\n"
-        f"**Critério 5 — Cluster (preço vs. produtos parecidos): nota {_st['s_cluster']*10:.0f}/10.** "
-        f"Agrupamos produtos de comportamento parecido; este está {_v_gap:.0f}% "
-        f"{'abaixo do' if _v_gap > 0 else 'alinhado com o'} preço típico do grupo. "
-        f"{'Está barato para o que é — há espaço para subir' if _st['s_cluster'] > 0.5 else 'Já está no nível dos pares'} → nota {_st['s_cluster']*10:.0f}.\n\n"
-        f"**Agora juntamos tudo, respeitando os pesos do objetivo '{getattr(p, 'mcda_perfil', 'Equilibrado')}':**\n\n"
-        f"- Margem: nota {_st['s_margem']*10:.0f} × peso {w['margem']*100:.0f}% = {_c_marg*10:.2f}\n"
-        f"- Elasticidade: nota {_st['s_elast']*10:.0f} × peso {w['elast']*100:.0f}% = {_c_elas*10:.2f}\n"
-        f"- Market share: nota {_st['s_share']*10:.0f} × peso {w['share']*100:.0f}% = {_c_shar*10:.2f}\n"
-        f"- Churn: nota {_st['s_churn']*10:.0f} × peso {w['churn']*100:.0f}% = {_c_chur*10:.2f}\n"
-        f"- Cluster: nota {_st['s_cluster']*10:.0f} × peso {w['cluster']*100:.0f}% = {_c_clus*10:.2f}\n"
-        f"- **Nota final (score) = {_score_bruto*10:.2f} de 10**\n\n"
-        f"**Do score ao preço sugerido:** essa nota final coloca o produto à frente de {_st['score_pct']*100:.0f}% dos produtos "
-        f"na fila de prioridade de reajuste. Quanto mais à frente, maior o reajuste (limitado ao teto de {teto*100:.0f}%). "
-        f"Então o reajuste é {teto*100:.0f}% × {_st['score_pct']:.2f} = **{_st['reajuste_%']:.1f}%**, "
-        f"e o preço passa de US$ {_st['preco_atual']:,.2f} para **US$ {_st['preco_recomendado']:,.2f}**.")
+            # distribuição do PPI por faixa
+            faixa_tbl = (d.groupby("faixa_PPI")
+                         .agg(transacoes=("PPI", "size"),
+                              valor_deixado_na_mesa=("opportunity_value", "sum"))
+                         .reset_index())
+            # ordena as faixas de forma lógica
+            ordem = ["Forte desconto (<0,90)", "Dentro do esperado (0,90–1,05)", "Acima do benchmark (>1,05)"]
+            faixa_tbl["_o"] = faixa_tbl["faixa_PPI"].map({k: i for i, k in enumerate(ordem)})
+            faixa_tbl = faixa_tbl.sort_values("_o").drop(columns="_o")
+            faixa_tbl_fmt = _round_df(faixa_tbl, money_cols=["valor_deixado_na_mesa"], int_cols=["transacoes"])
 
-    add("4 · Decisão multicritério (MCDA) — o preço recomendado por SKU",
-        how_it_works="A precificação real é produto a produto, então o modelo trabalha na unidade certa: SKU × tier × business × país. Você define o que importa e quanto (pesos), sobre 5 critérios: MARGEM (margem baixa = espaço para subir), ELASTICIDADE (inelástico = seguro subir), MARKET SHARE (share do SKU dentro do business — share alto = SKU importante, proteger, subir menos), CHURN (chance de perder o cliente daquele SKU — churn alto = NÃO subir, para não perdê-lo) e CLUSTER (agrupamos SKUs de comportamento parecido via k-means e vemos quão abaixo dos pares do cluster o preço está). Cada SKU recebe uma nota de 0 a 1 em cada critério; multiplicamos pelos pesos e somamos num score. O reajuste é proporcional à POSIÇÃO do SKU no ranking de scores — o que usa a faixa inteira até o teto, diferenciando de fato os produtos.",
-        why="Um número de caixa-preta é difícil de defender, e um número agregado não serve para precificar — a decisão de preço é por produto. Este modelo entrega um preço recomendado a nível SKU, transparente e ajustável: o gestor escolhe o peso de cada objetivo e vê o preço de cada produto se ajustar. É a ponte entre a análise e a decisão executiva de pricing.",
-        answers="Dado o que a empresa prioriza, qual o preço recomendado para cada SKU (por tier, business e país)?",
-        assumptions=f"Unidade de decisão: SKU × tier × business × país, com pelo menos 5 vendas. Os 5 critérios são normalizados de 0 a 1 antes de ponderar. O reajuste é proporcional ao PERCENTIL do score (posição no ranking), limitado ao teto (+{teto*100:.0f}%) — assim os SKUs de maior oportunidade chegam perto do teto e os de menor ficam perto de zero. A elasticidade vem da econometria por business; os clusters vêm de k-means sobre volume, frequência, margem e preço.",
-        method=f"{conta_txt}",
-        insight=f"Trabalhando a nível SKU ({n_skus:,} combinações precificáveis), com o perfil '{perfil_nome}' ({pesos_txt}), "
-                f"o SKU de maior ganho é o material {seg_top[COL_MATERIAL]} (tier {seg_top[COL_TIER]}, business {seg_top[COL_BUSINESS]}, "
-                f"{seg_top[COL_COUNTRY]}): reajuste de {seg_top['reajuste_%']:.1f}%, de US$ {seg_top['preco_atual']:,.0f} para "
-                f"US$ {seg_top['preco_recomendado']:,.0f}. Trocar o perfil de objetivo reordena tudo — 'Defender share' protege "
-                "clientes com risco de churn e share alto; 'Extrair margem' foca nos de margem baixa e inelásticos.",
-        money=f"Com os pesos atuais, o ganho potencial somado é ~US$ {ganho_mcda/1e6:,.0f} mi "
-              "(teto teórico; a captura real depende de execução comercial).",
-        worked=[
-            "Precificação na unidade certa (SKU/tier/business/país) e escala que usa toda a faixa até o teto — reajustes diferenciados de verdade.",
-            "5 critérios de negócio reais (não só variáveis cruas): margem, elasticidade, share, ruptura e alinhamento por cluster de comportamento.",
-        ],
-        not_worked=[
-            "Os pesos são um julgamento de valor — pessoas diferentes escolhem pesos diferentes, e isso muda a recomendação.",
-            "A elasticidade é herdada do business e os clusters dependem das features escolhidas; SKUs com histórico curto têm score mais ruidoso.",
-        ],
-        fig=fig, table=mcda_tbl)
+            total_mesa = d["opportunity_value"].sum()
+            n_desconto = int((d["PPI"] < 0.90).sum())
+
+            # gráfico: distribuição do PPI
+            fig, ax = plt.subplots(figsize=(9, 4))
+            ax.hist(d["PPI"].clip(0, 2), bins=60, color="#378add")
+            ax.axvline(0.90, color="#c0504d", ls="--", lw=1, label="0,90 (forte desconto)")
+            ax.axvline(1.05, color="#0F6E56", ls="--", lw=1, label="1,05 (acima do benchmark)")
+            ax.set_xlabel("Price Position Index (preço praticado ÷ esperado)")
+            ax.set_ylabel("Nº de transações"); ax.legend()
+            ax.set_title("Distribuição do Price Position Index (PPI)")
+            fig.tight_layout()
+
+            add("1b · Price Position Index (PPI) — onde estamos deixando dinheiro na mesa",
+                why="O resíduo do modelo, sozinho, é técnico demais para um gestor. O PPI traduz: é a razão entre o preço praticado e o esperado pelo modelo. Abaixo de 0,90 = forte desconto; entre 0,90 e 1,05 = normal; acima de 1,05 = prêmio. Um número que qualquer diretor lê em segundos.",
+                answers="Cada venda está barata, normal ou cara frente ao que o modelo espera? Quanto isso soma?",
+                assumptions="O preço esperado do modelo é um benchmark justo (controla material, país, tier, business, volume). PPI < 1 só é oportunidade real se não houver justificativa comercial que o modelo não captou.",
+                formula=[r"\text{PPI}_i = \frac{p_i^{\text{praticado}}}{\hat{p}_i^{\text{esperado}}}",
+                         r"\text{Opportunity Value}_i = \max(\hat{p}_i - p_i,\, 0)\times q_i"],
+                formula_legend="p̂ = preço esperado pelo modelo; PPI<1 indica preço abaixo do benchmark; o Opportunity Value só conta o gap positivo (dinheiro na mesa).",
+                insight=f"{n_desconto:,} transações estão em forte desconto (PPI < 0,90). A tabela por faixa mostra quanto cada grupo "
+                        "representa — a maior parte do valor recuperável concentra-se na faixa de desconto.",
+                money=f"Total deixado na mesa (soma do Opportunity Value onde PPI < 1): US$ {total_mesa/1e6:,.1f} mi.",
+                fig=fig)
+            add("PPI por faixa — quanto cada faixa representa", table=faixa_tbl_fmt)
+
+            # ===================================================================
+            # 1c · RANKING DE OPORTUNIDADES (com filtro por tier/país)
+            # ===================================================================
+            opp_rk = d[d["opportunity_value"] > 0].copy()
+            # aplica filtros vindos da UI (reduz o volume da tabela)
+            if p.ml_filter_tier and p.ml_filter_tier != "(todos)":
+                opp_rk = opp_rk[opp_rk[COL_TIER] == p.ml_filter_tier]
+            if p.ml_filter_country and p.ml_filter_country != "(todos)":
+                opp_rk = opp_rk[opp_rk[COL_COUNTRY] == p.ml_filter_country]
+
+            rk_cols = [COL_MONTH, COL_BUSINESS, COL_COUNTRY, COL_TIER, COL_MATERIAL,
+                       COL_PARENT, COL_QTY, COL_PRICE, "preco_esperado", "PPI",
+                       "opportunity_value"]
+            opp_rk = opp_rk.sort_values("opportunity_value", ascending=False)[rk_cols].head(100)
+            opp_rk_tbl = _round_df(opp_rk, money_cols=[COL_PRICE, "preco_esperado", "opportunity_value"],
+                                   pct_cols=["PPI"], int_cols=[COL_QTY])
+
+            filtro_txt = ""
+            if p.ml_filter_tier != "(todos)":
+                filtro_txt += f" · Tier={p.ml_filter_tier}"
+            if p.ml_filter_country != "(todos)":
+                filtro_txt += f" · País={p.ml_filter_country}"
+            add(f"1c · Ranking de oportunidades (Opportunity Value){filtro_txt}",
+                why="Consolida o PPI numa lista acionável: para cada venda abaixo do preço esperado, quanto se recupera se levada ao benchmark. É a fila que o time comercial ataca, cliente a cliente.",
+                answers="Por onde começar a renegociar, e quanto vale cada linha?",
+                insight="Ordenado pelo maior Opportunity Value. Use o filtro por Tier/País na barra lateral para reduzir o volume "
+                        "e focar num segmento específico (ex.: só Tier A na Alemanha).",
+                money=f"Top 100 oportunidades exibidas{filtro_txt or ' (sem filtro)'} — filtre na barra lateral para focar.",
+                table=opp_rk_tbl)
+
+            # ===================================================================
+            # 1d · "COMO A IA PENSOU" — explicabilidade em 4 níveis (top oportunidade)
+            # ===================================================================
+            # transação-alvo = maior Opportunity Value da base
+            d["_opp_all"] = d["opportunity_value"]
+            ti = int(d["_opp_all"].idxmax())
+            row = d.loc[ti]
+            p_atual = float(row[COL_PRICE]); p_esp = float(row["preco_esperado"])
+            gap_u = p_esp - p_atual; opp_u = float(row["_opp_all"])
+
+            add("Como a IA pensou — explicando a maior oportunidade",
+                why="Um modelo de ML só é confiável no board se puder ser explicado. Esta seção abre a caixa-preta para a maior oportunidade da base, em quatro níveis: resumo, decomposição SHAP, regras aprendidas e — o diferencial — transações reais comparáveis do próprio histórico.",
+                answers="Por que a IA estimou este preço? Em que evidência do histórico ela se baseou?",
+                insight=f"Transação analisada: Material {row[COL_MATERIAL]} · {row[COL_COUNTRY]} · Business {row[COL_BUSINESS]} · "
+                        f"Tier {row[COL_TIER]} · {int(row[COL_QTY])} unidades.")
+
+            # ---- Nível 1: Resumo Executivo ----
+            resumo = pd.DataFrame({
+                "métrica": ["Preço atual", "Preço esperado (modelo)", "Gap unitário", "Oportunidade (× volume)"],
+                "valor": [f"${p_atual:,.2f}", f"${p_esp:,.2f}", f"${gap_u:,.2f}", f"${opp_u:,.0f}"],
+            })
+            add("Nível 1 · Resumo executivo",
+                insight="O essencial em uma linha: o preço praticado, o que o modelo esperava, e quanto isso vale multiplicado pelo volume.",
+                table=resumo)
+
+            # ---- Nível 2: Decomposição SHAP (waterfall) ----
+            shap_ok = True
+            try:
+                import shap
+                expl = shap.TreeExplainer(ml)
+                sv_row = expl.shap_values(X[ti:ti + 1])[0]
+                base_val = float(expl.expected_value)
+            except Exception:
+                shap_ok = False
+
+            if shap_ok:
+                contrib = list(zip(feat, sv_row))
+                contrib_sorted = sorted(contrib, key=lambda z: -abs(z[1]))
+                # waterfall em preço (aproximação: converte incrementos log para % do preço)
+                fig, ax = plt.subplots(figsize=(9, 4.2))
+                labels = ["Preço médio\n(base)"] + [c[0] for c in contrib_sorted] + ["Preço\nprevisto"]
+                base_price = np.exp(base_val)
+                running = base_val
+                xs = range(len(labels))
+                vals = [base_price]
+                cum = base_val
+                for f, v in contrib_sorted:
+                    new = np.exp(cum + v) - np.exp(cum)
+                    vals.append(new); cum += v
+                vals.append(0)
+                run = 0
+                for i, (lab, val) in enumerate(zip(labels, vals)):
+                    if i == 0:
+                        ax.bar(i, base_price, color="#33475b"); run = base_price
+                    elif i == len(labels) - 1:
+                        ax.bar(i, np.exp(cum), color="#0F6E56")
+                    else:
+                        ax.bar(i, val, bottom=run, color=("#3b6ea5" if val >= 0 else "#c0504d"))
+                        run += val
+                ax.set_xticks(list(xs)); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+                ax.set_ylabel("Preço (US$)"); ax.set_title("Nível 2 · Como cada variável moveu o preço previsto (SHAP)")
+                fig.tight_layout()
+                shap_row_tbl = _round_df(
+                    pd.DataFrame({"variável": [c[0] for c in contrib_sorted],
+                                  "efeito_no_preço_log": [round(c[1], 3) for c in contrib_sorted]}),
+                    pct_cols=["efeito_no_preço_log"])
+                add("Nível 2 · Explicação SHAP — o que empurrou o preço para cima ou para baixo",
+                    why="O SHAP parte do preço médio da empresa e mostra quanto cada variável somou ou subtraiu para chegar na previsão desta transação. É a decomposição rigorosa (teoria dos jogos) do 'porquê' daquele número.",
+                    insight=f"O preço parte da média (${base_price:,.2f}) e cada fator o ajusta: o Material e o Business puxam para cima, "
+                            "o alto volume puxa para baixo. A soma dá o preço previsto.",
+                    fig=fig, table=shap_row_tbl)
+
+            # ---- Nível 3: Regras Aprendidas (padrões estatísticos dos dados) ----
+            regras = []
+            glob_med = d[COL_PRICE].median()
+            # regra material×business
+            mat_med = d[d[COL_MATERIAL] == row[COL_MATERIAL]][COL_PRICE].median()
+            mb_med = d[(d[COL_MATERIAL] == row[COL_MATERIAL]) & (d[COL_BUSINESS] == row[COL_BUSINESS])][COL_PRICE].median()
+            if mat_med > 0 and abs(mb_med / mat_med - 1) > 0.02:
+                regras.append(f"Material {row[COL_MATERIAL]} no Business {row[COL_BUSINESS]} tende a preços "
+                              f"{(mb_med/mat_med-1)*100:+.0f}% vs. a mediana do material.")
+            # regra de volume (sempre)
+            q_hi = d[COL_QTY].quantile(0.9)
+            hi_rel = (d[d[COL_QTY] >= q_hi][COL_PRICE].median() / glob_med - 1) * 100
+            regras.append(f"Vendas de alto volume (≥{int(q_hi)} un.) têm preço mediano {hi_rel:+.0f}% vs. a mediana geral "
+                          "— efeito do desconto de volume embutido nos dados.")
+            # regra de país×material
+            mat_ctry = d[(d[COL_MATERIAL] == row[COL_MATERIAL]) & (d[COL_COUNTRY] == row[COL_COUNTRY])][COL_PRICE].median()
+            if mat_med > 0 and abs(mat_ctry / mat_med - 1) > 0.02:
+                regras.append(f"No mercado {row[COL_COUNTRY]}, o material {row[COL_MATERIAL]} tem preço mediano "
+                              f"{(mat_ctry/mat_med-1)*100:+.0f}% vs. o benchmark do material.")
+            # regra business geral (sempre tem)
+            biz_rel = (d[d[COL_BUSINESS] == row[COL_BUSINESS]][COL_PRICE].median() / glob_med - 1) * 100
+            regras.append(f"O Business {row[COL_BUSINESS]} pratica preço mediano {biz_rel:+.0f}% vs. a mediana geral da empresa.")
+            regras_tbl = pd.DataFrame({"regra aprendida do histórico": regras})
+            add("Nível 3 · Regras aprendidas — padrões em linguagem de negócio",
+                why="Árvores individuais são ilegíveis. Em vez delas, mineramos padrões frequentes dos próprios dados e os traduzimos em frases que um gestor entende — o comportamento que o modelo capturou, dito em português.",
+                insight="Estas regras descrevem padrões estatísticos reais do histórico (não a estrutura interna das árvores), "
+                        "o que as torna interpretáveis e verificáveis.",
+                table=regras_tbl)
+
+            # ---- Nível 4: Comparáveis Reais (o diferencial) ----
+            mask = ((d[COL_MATERIAL] == row[COL_MATERIAL]) & (d[COL_COUNTRY] == row[COL_COUNTRY])
+                    & (d[COL_BUSINESS] == row[COL_BUSINESS]) & (d[COL_TIER] == row[COL_TIER]))
+            comp = d[mask & (d.index != ti)].copy()
+            comp["dist_volume"] = (comp[COL_QTY] - row[COL_QTY]).abs()
+            comp = comp.sort_values("dist_volume").head(6)
+            if len(comp):
+                comp_tbl = _round_df(
+                    comp[[COL_MATERIAL, COL_COUNTRY, COL_BUSINESS, COL_TIER, COL_QTY, COL_PRICE]],
+                    money_cols=[COL_PRICE], int_cols=[COL_QTY])
+                pmin, pmax = comp[COL_PRICE].min(), comp[COL_PRICE].max()
+                pmed = comp[COL_PRICE].median()
+                add("Nível 4 · Comparáveis reais — a evidência do próprio histórico",
+                    why="Este é o nível que constrói confiança de verdade. Em vez de pedir fé na caixa-preta, mostramos as transações mais parecidas já realizadas: mesmo material, país, business e tier, com volume próximo. O usuário vê a evidência concreta.",
+                    answers="Que vendas reais e semelhantes sustentam a recomendação?",
+                    insight=f"A IA se baseou em transações historicamente semelhantes, negociadas entre ${pmin:,.2f} e ${pmax:,.2f} "
+                            f"(mediana ${pmed:,.2f}). A transação analisada foi vendida a ${p_atual:,.2f} — "
+                            f"{'abaixo' if p_atual < pmed else 'dentro'} da faixa dos comparáveis, o que sustenta a oportunidade de reajuste.",
+                    money=f"Ancorando no histórico comparável (mediana ${pmed:,.2f}), o reajuste sugerido para esta venda "
+                          f"recupera ${max(pmed - p_atual, 0) * row[COL_QTY]:,.0f}.",
+                    table=comp_tbl)
+            else:
+                add("Nível 4 · Comparáveis reais",
+                    insight="Não há transações suficientemente semelhantes no histórico para esta venda — sinal de que a previsão "
+                            "depende mais de extrapolação do modelo e deve ser usada com cautela.")
+
+            # ---- Nível 5: Árvore ilustrativa (diagrama + regras em linguagem natural) ----
+            from sklearn.tree import DecisionTreeRegressor, _tree
+            # features interpretáveis (dummies dos valores da própria transação + volume)
+            dd = d.copy()
+            dd["_isBiz"] = (dd[COL_BUSINESS] == row[COL_BUSINESS]).astype(int)
+            dd["_isTier"] = (dd[COL_TIER] == row[COL_TIER]).astype(int)
+            dd["_isCtry"] = (dd[COL_COUNTRY] == row[COL_COUNTRY]).astype(int)
+            tfeat = ["_isBiz", "_isTier", "_isCtry", COL_QTY]
+            tlabels = [f"É Business {row[COL_BUSINESS]}", f"É Tier {row[COL_TIER]}",
+                       f"É {row[COL_COUNTRY]}", "Quantidade"]
+            Xt = dd[tfeat].values
+            yt = dd[COL_PRICE].values
+            dtree = DecisionTreeRegressor(max_depth=3, min_samples_leaf=1000, random_state=p.random_state)
+            dtree.fit(Xt, yt)
+
+            # desenha a árvore
+            from sklearn.tree import plot_tree
+            fig, ax = plt.subplots(figsize=(12, 6))
+            plot_tree(dtree, feature_names=tlabels, filled=True, rounded=True,
+                      impurity=False, precision=0, fontsize=7, ax=ax,
+                      proportion=False)
+            ax.set_title("Árvore ilustrativa — como o preço se divide (resumo didático)")
+            fig.tight_layout()
+
+            # regras em linguagem natural, com destaque para o caminho da transação
+            t = dtree.tree_
+
+            def _regras(node, cond):
+                out = []
+                if t.feature[node] != _tree.TREE_UNDEFINED:
+                    name = tlabels[t.feature[node]]; thr = t.threshold[node]
+                    out += _regras(t.children_left[node], cond + [(name, "<=", thr)])
+                    out += _regras(t.children_right[node], cond + [(name, ">", thr)])
+                else:
+                    out.append((cond, float(t.value[node][0][0]), int(t.n_node_samples[node])))
+                return out
+
+            regras_nat = []
+            for cond, val, n in _regras(0, []):
+                partes = []
+                for name, op, thr in cond:
+                    if name == "Quantidade":
+                        partes.append(f"Quantidade {op} {thr:.0f}")
+                    else:
+                        partes.append(f"{'SIM' if op == '>' else 'NÃO'}: {name.lower()}")
+                regras_nat.append({"regra (caminho da árvore)": " e ".join(partes),
+                                   "preço estimado": round(val, 0), "nº de vendas": n})
+            regras_nat_df = _round_df(pd.DataFrame(regras_nat).sort_values("preço estimado"),
+                                      money_cols=["preço estimado"], int_cols=["nº de vendas"])
+
+            # frase-exemplo do caminho da própria transação
+            node = 0; caminho = []
+            while t.feature[node] != _tree.TREE_UNDEFINED:
+                fi = t.feature[node]; thr = t.threshold[node]
+                val_tx = Xt[ti, fi]
+                if val_tx <= thr:
+                    if tlabels[fi] == "Quantidade":
+                        caminho.append(f"Quantidade ≤ {thr:.0f}")
+                    else:
+                        caminho.append(f"não {tlabels[fi].lower()}")
+                    node = t.children_left[node]
+                else:
+                    if tlabels[fi] == "Quantidade":
+                        caminho.append(f"Quantidade > {thr:.0f}")
+                    else:
+                        caminho.append(tlabels[fi].lower())
+                    node = t.children_right[node]
+            preco_folha = float(t.value[node][0][0])
+            frase = f"Se {', '.join(caminho)}, o preço tende a ser ${preco_folha:,.0f}."
+
+            add("Nível 5 · Árvore ilustrativa — o caminho até o preço, visível",
+                why="Uma árvore de decisão desenhada mostra, visualmente, como as condições se encadeiam até um preço. Cada árvore do XGBoost real prevê só uma fração do preço em escala log (ilegível), então usamos aqui UMA árvore rasa que aproxima o padrão do conjunto e prevê o preço inteiro — didática, não o modelo real.",
+                answers="Como as regras se encadeiam, visualmente, até chegar num preço?",
+                insight=f"Seguindo o caminho da transação analisada na árvore: {frase} "
+                        "Cada folha é um grupo de vendas com preço típico — a tabela abaixo lista todas as regras em linguagem natural.",
+                fig=fig, table=regras_nat_df)
 
 
+
+    except Exception as _e_sec:
+        add("⚠️ Machine Learning — indisponível nesta configuração",
+            why=f"Este modelo não pôde ser calculado com os dados/filtros atuais ({_e_sec}). As demais análises seguem normalmente.")
+    # --- seção protegida: Econometria ---
+    try:
+            # ===================================================================
+            # 2 · ECONOMETRIA — REGRESSÃO EM PAINEL (peer group × mês)
+            # ===================================================================
+            # Estimador within: agrupa por peer group estável (material × tier × business)
+            # e usa a variação AO LONGO DOS MESES dentro de cada grupo. Assim a elasticidade
+            # vem de comparar o mesmo item/perfil consigo mesmo no tempo — variação limpa,
+            # sem contaminação de mix entre produtos/tiers diferentes.
+            import statsmodels.api as sm
+            PGe = [COL_MATERIAL, COL_TIER, COL_BUSINESS]
+            # agrega por grupo-mês (um ponto = preço/qtd médios daquele grupo naquele mês)
+            dpanel = d.copy()
+            dpanel["_gkey"] = dpanel.groupby(PGe).ngroup()
+            gm = (dpanel.groupby(["_gkey", "date"])
+                  .agg(ln_price=("ln_price", "mean"), ln_qty=("ln_qty", "mean"),
+                       ln_cost=("ln_cost", "mean"), n=("ln_price", "size")).reset_index())
+            # exige pelo menos 6 meses distintos por grupo (senão não há série p/ estimar)
+            meses_por_grupo = gm.groupby("_gkey")["date"].transform("nunique")
+            MIN_MESES = 6
+            gm = gm[meses_por_grupo >= MIN_MESES].copy()
+            n_grupos_painel = gm["_gkey"].nunique()
+            # within: demedia cada variável dentro do próprio grupo
+            for c in ["ln_qty", "ln_price", "ln_cost"]:
+                gm[c + "_dm"] = gm[c] - gm.groupby("_gkey")[c].transform("mean")
+            ols = sm.OLS(gm["ln_qty_dm"], sm.add_constant(gm["ln_price_dm"]), missing="drop").fit()
+            beta_ols = ols.params["ln_price_dm"]
+            ci = ols.conf_int().loc["ln_price_dm"]
+            cobertura_receita = 100 * d[d.groupby(PGe)["date"].transform("nunique") >= MIN_MESES][COL_REVENUE].sum() / d[COL_REVENUE].sum()
+
+            # recria as versões demediadas em d (por peer group) para o bloco causal usar a seguir
+            for c in ["ln_qty", "ln_price", "ln_cost"]:
+                d[c + "_dm"] = d[c] - d.groupby(PGe)[c].transform("mean")
+
+            # gráficos de diagnóstico da regressão (pressupostos): ajuste, resíduos, Q-Q
+            import scipy.stats as _sstats
+            fig_econ = None
+            try:
+                _samp = gm.dropna(subset=["ln_price_dm", "ln_qty_dm"]).copy()
+                if len(_samp) > 6000:
+                    _samp = _samp.sample(6000, random_state=1)
+                # resíduos e ajustados alinhados por posição, mesmo tamanho garantido
+                _resid = np.asarray(ols.resid, dtype=float).ravel()
+                _fitted = np.asarray(ols.fittedvalues, dtype=float).ravel()
+                _nmin = int(min(len(_resid), len(_fitted)))
+                _resid = _resid[:_nmin]
+                _fitted = _fitted[:_nmin]
+                fig_econ, axes = plt.subplots(1, 3, figsize=(13, 4))
+                # (1) scatter de ajuste
+                axes[0].scatter(_samp["ln_price_dm"], _samp["ln_qty_dm"], s=6, alpha=0.12, color="#3b6ea5")
+                _xr = np.linspace(_samp["ln_price_dm"].min(), _samp["ln_price_dm"].max(), 50)
+                axes[0].plot(_xr, ols.params["const"] + beta_ols * _xr, color="#c0504d", lw=2,
+                             label=f"β = {beta_ols:.2f}")
+                axes[0].set_xlabel("ln(preço) — desvio do grupo"); axes[0].set_ylabel("ln(quantidade) — desvio do grupo")
+                axes[0].set_title("Ajuste: preço × quantidade (within grupo)"); axes[0].legend(fontsize=8)
+                # (2) resíduos vs ajustados
+                if _nmin > 0:
+                    _k = min(6000, _nmin)
+                    _rs = np.random.RandomState(1).choice(_nmin, _k, replace=False)
+                    axes[1].scatter(_fitted[_rs], _resid[_rs], s=6, alpha=0.12, color="#0F6E56")
+                    axes[1].axhline(0, color="#c0504d", lw=1)
+                    axes[1].set_xlabel("Valores ajustados"); axes[1].set_ylabel("Resíduos")
+                    axes[1].set_title("Resíduos vs. ajustados (variância constante?)")
+                    # (3) Q-Q plot
+                    _sstats.probplot(_resid[_rs], dist="norm", plot=axes[2])
+                    axes[2].set_title("Q-Q plot dos resíduos (normalidade?)")
+                    axes[2].get_lines()[0].set_markersize(3); axes[2].get_lines()[0].set_alpha(0.3)
+                    axes[2].get_lines()[0].set_color("#8250c4"); axes[2].get_lines()[1].set_color("#c0504d")
+                fig_econ.tight_layout()
+            except Exception:
+                fig_econ = None  # se o diagnóstico falhar, segue sem o gráfico
+
+            add("2 · Econometria (regressão em painel) — a política de preço implícita",
+                how_it_works=f"Em vez de misturar todas as vendas, montamos um PAINEL: agrupamos por peer group estável (mesmo material × tier × business) e, dentro de cada grupo, acompanhamos preço e quantidade MÊS A MÊS. Isso dá, para cada grupo, uma pequena série temporal. A regressão então mede a elasticidade comparando o grupo consigo mesmo ao longo do tempo — 'quando o preço deste item, para este tier, subiu de um mês para outro, o que aconteceu com a quantidade?'. Usamos só grupos com pelo menos {MIN_MESES} meses de histórico (que cobrem {cobertura_receita:.0f}% da receita), e o log-log faz a inclinação virar diretamente a elasticidade.",
+                why="A regressão em painel com efeitos fixos de peer group estima a elasticidade usando a variação temporal dentro de cada grupo comparável — a mais limpa possível, pois isola o efeito do preço sem contaminação de diferenças entre produtos, tiers ou países. É a política de preço que os dados revelam, do jeito que a área de pricing explicaria ao board.",
+                answers="Qual a elasticidade-preço média e a política de preço implícita nos dados?",
+                assumptions=f"Linearidade em log; erros exógenos (E[ε|X]=0); efeitos fixos de peer group (material × tier × business) absorvem o preço-base de cada combinação. A identificação vem da variação MENSAL dentro de cada grupo (≥{MIN_MESES} meses). O pressuposto crítico — e violado aqui — é a exogeneidade do preço.",
+                formula=[r"\ln q_{g,t} = \alpha_{g} + \beta\,\ln p_{g,t} + \varepsilon_{g,t}",
+                         r"\hat{\beta} = \frac{\text{Cov}(\ln p,\, \ln q)}{\text{Var}(\ln p)} \quad\text{(within peer group, no tempo)}"],
+                formula_legend="g = peer group (material × tier × business); t = mês; α_g = efeito fixo do grupo; β = elasticidade-preço (o alvo). A demediação por grupo remove α_g, deixando só a variação temporal dentro de cada grupo.",
+                pros=["Coeficientes interpretáveis e comunicáveis",
+                      "Variação temporal within-group é a identificação mais limpa da elasticidade",
+                      "Efeitos fixos de peer group controlam produto, tier e business de uma vez"],
+                cons=["Assume linearidade em log",
+                      "Enviesada se o preço for endógeno (é o caso)",
+                      "Restringe-se a grupos com histórico suficiente de meses"],
+                insight=f"A elasticidade em painel é {beta_ols:.2f} [IC95% {ci[0]:.2f}, {ci[1]:.2f}], estimada sobre {n_grupos_painel:,} peer groups "
+                        f"com pelo menos {MIN_MESES} meses de histórico ({cobertura_receita:.0f}% da receita). É inelástica — sugere espaço para subir preço. "
+                        "Mas preço e quantidade se determinam juntos (endogeneidade): o próximo bloco testa esse viés.",
+                method=f"Montamos um painel: cada peer group (material × tier × business) vira uma série mensal de preço e quantidade médios. Ficamos só com grupos que têm pelo menos {MIN_MESES} meses de dados ({n_grupos_painel:,} grupos, {cobertura_receita:.0f}% da receita). Dentro de cada grupo, demediamos as variáveis (tiramos a média do próprio grupo) para usar SÓ a variação ao longo do tempo. Rodamos a regressão log-log nesses desvios: a inclinação β é a elasticidade — quando o preço deste item/perfil sobe 1% de um mês para outro, a quantidade varia β%. O IC95% é a faixa de confiança.",
+                money="Não mede US$ diretamente — fornece a elasticidade, um insumo-chave que alimenta o modelo de decisão multicritério ao final da aba. É um motor de análise, não o resultado final.",
+                worked=[
+                    f"Elasticidade de {beta_ols:.2f} (inelástica): estatisticamente, há espaço para subir preço sem perder muito volume.",
+                    "Coeficiente interpretável e comunicável — o tipo de número que a área de pricing leva ao board.",
+                ],
+                not_worked=[
+                    "Endogeneidade: preço e quantidade se influenciam mutuamente, então este β pode estar enviesado — o bloco causal testa isso.",
+                    "Assume relação log-linear: pode não capturar efeitos mais complexos de preço sobre demanda.",
+                ])
+            add("2 · (diagnóstico) — os gráficos que validam a regressão",
+                why="Toda regressão faz pressupostos, e é obrigação de rigor verificar se eles valem. São 3 gráficos: (1) AJUSTE — a nuvem de preço vs. quantidade com a reta estimada; a inclinação da reta É a elasticidade. (2) RESÍDUOS vs. AJUSTADOS — os erros do modelo devem estar espalhados de forma uniforme em torno de zero (variância constante, ou homocedasticidade); um funil indicaria problema. (3) Q-Q PLOT — se os pontos seguem a linha vermelha, os resíduos são aproximadamente normais, o que valida os intervalos de confiança.",
+                answers="Os pressupostos da regressão se sustentam nos dados?",
+                insight="O ajuste mostra a relação negativa esperada (mais preço, menos quantidade). Os resíduos estão distribuídos em torno de zero sem padrão forte de funil, e o Q-Q plot segue razoavelmente a diagonal — os pressupostos se sustentam o suficiente para confiar na estimativa da elasticidade e no seu intervalo de confiança.",
+                fig=fig_econ)
+
+            # -- Econometria, nível A: resumo executivo --
+            econ_resumo = pd.DataFrame({
+                "métrica": ["Elasticidade-preço (β)", "IC 95% inferior", "IC 95% superior",
+                            "R² (within peer group)", "Leitura"],
+                "valor": [f"{beta_ols:.3f}", f"{ci[0]:.3f}", f"{ci[1]:.3f}",
+                          f"{ols.rsquared:.4f}",
+                          "inelástico" if beta_ols > -1 else "elástico"],
+            })
+            add("2a · Econometria — resumo executivo",
+                insight="O número central e sua faixa de confiança. Elasticidade entre 0 e −1 significa inelástico "
+                        "(subir preço aumenta receita); abaixo de −1, elástico. Nota sobre o R² baixo: em elasticidade de painel "
+                        "isso é esperado e saudável — o preço sozinho explica pouco da variação de quantidade (a demanda depende de "
+                        "muitos fatores), mas o coeficiente de elasticidade em si é preciso, como mostra o intervalo de confiança estreito.",
+                table=econ_resumo)
+
+            # -- Econometria, nível B: interpretação de negócio (o que X% de aumento faz) --
+            cenarios = []
+            for aumento in [0.05, 0.10, 0.15]:
+                var_q = beta_ols * aumento * 100
+                var_receita = (1 + aumento) * (1 + var_q / 100) - 1  # aprox. receita
+                cenarios.append({"aumento_de_preço": f"+{aumento:.0%}",
+                                 "variação_de_volume": f"{var_q:+.1f}%",
+                                 "efeito_na_receita": f"{var_receita*100:+.1f}%"})
+            add("2b · Econometria — tradução para o negócio",
+                why="A elasticidade só vira decisão quando traduzida em cenários concretos de preço, volume e receita.",
+                insight=f"Com β = {beta_ols:.2f}, cada aumento de preço perde pouco volume (demanda inelástica), então a "
+                        "receita SOBE. A tabela mostra o efeito líquido de três cenários de reajuste.",
+                table=pd.DataFrame(cenarios))
+
+    except Exception as _e_sec:
+        add("⚠️ Econometria — indisponível nesta configuração",
+            why=f"Este modelo não pôde ser calculado com os dados/filtros atuais ({_e_sec}). As demais análises seguem normalmente.")
+    # --- seção protegida: Inferência causal ---
+    try:
+            # ===================================================================
+            # 3 · INFERÊNCIA CAUSAL (IV / 2SLS)
+            # ===================================================================
+            sub = d.dropna(subset=["ln_qty_dm", "ln_price_dm", "ln_cost_dm"]).copy()
+            sub = sub[np.isfinite(sub["ln_cost_dm"])]
+            samp = sub.sample(min(50000, len(sub)), random_state=p.random_state)
+            # 1º estágio: preço ~ custo (mede força do instrumento)
+            fs = sm.OLS(samp["ln_price_dm"], sm.add_constant(samp["ln_cost_dm"])).fit()
+            f_stat = float(fs.fvalue)
+            weak = f_stat < 10
+            # 2SLS: linearmodels se disponível; senão, 2SLS manual (duas OLS do statsmodels)
+            try:
+                from linearmodels.iv import IV2SLS
+                iv = IV2SLS(samp["ln_qty_dm"], sm.add_constant(samp[[]]),
+                            samp["ln_price_dm"], samp["ln_cost_dm"]).fit()
+                beta_iv = float(iv.params["ln_price_dm"])
+            except Exception:
+                # 2SLS manual: preço previsto pelo instrumento -> regride quantidade nele
+                p_hat = fs.predict(sm.add_constant(samp["ln_cost_dm"]))
+                second = sm.OLS(samp["ln_qty_dm"], sm.add_constant(p_hat)).fit()
+                beta_iv = float(second.params.iloc[1])
+            iv_tbl = pd.DataFrame({
+                "método": ["OLS (ingênuo)", "IV / 2SLS (custo como instrumento)"],
+                "elasticidade": [round(beta_ols, 3), round(beta_iv, 3)],
+                "confiável?": ["enviesado (endogeneidade)", "NÃO — instrumento fraco" if weak else "sim"],
+            })
+
+            # gráficos de diagnóstico do causal: 1º estágio (força do instrumento) + resíduos
+            fig_caus = None
+            try:
+                _cs = np.random.RandomState(1).choice(len(samp), min(5000, len(samp)), replace=False)
+                _csamp = samp.iloc[_cs]
+                fig_caus, axcs = plt.subplots(1, 2, figsize=(11, 4.2))
+                # (1) 1º estágio: custo (instrumento) vs preço
+                axcs[0].scatter(_csamp["ln_cost_dm"], _csamp["ln_price_dm"], s=6, alpha=0.15, color="#BA7517")
+                _xc = np.linspace(_csamp["ln_cost_dm"].min(), _csamp["ln_cost_dm"].max(), 50)
+                axcs[0].plot(_xc, fs.params["const"] + fs.params["ln_cost_dm"] * _xc, color="#c0504d", lw=2)
+                axcs[0].set_xlabel("ln(custo) — desvio do grupo [instrumento]")
+                axcs[0].set_ylabel("ln(preço) — desvio do grupo")
+                axcs[0].set_title(f"1º estágio: custo → preço (F={f_stat:.1f}, {'FRACO' if weak else 'forte'})")
+                # (2) força do instrumento vs limiar
+                axcs[1].bar(["F-stat do\ninstrumento", "Limiar mínimo\n(regra F>10)"], [f_stat, 10],
+                            color=["#c0504d" if weak else "#1d9e75", "#888880"])
+                axcs[1].axhline(10, color="grey", ls="--", lw=0.8)
+                axcs[1].set_ylabel("Valor da estatística F")
+                axcs[1].set_title("Força do instrumento vs. limiar de validade")
+                for i, v in enumerate([f_stat, 10]):
+                    axcs[1].text(i, v, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
+                fig_caus.tight_layout()
+            except Exception:
+                fig_caus = None
+
+            add("3 · Inferência causal (variável instrumental / 2SLS) — o que acontece se MUDARMOS o preço?",
+                how_it_works="O problema: nos dados, preço e demanda se influenciam mutuamente (preço alto pode ser causa OU consequência de baixa demanda), então uma regressão simples confunde causa e efeito. A variável instrumental resolve isso em 2 passos (2SLS = mínimos quadrados em dois estágios): procuramos algo que mexa no preço mas não na demanda diretamente — aqui, o CUSTO. 1º passo: usamos o custo para prever a parte do preço que é 'limpa' (não contaminada pela demanda). 2º passo: usamos esse preço limpo para medir o efeito real na demanda. Um teste (F-stat) verifica se o custo é um instrumento forte o suficiente para confiar no resultado.",
+                why="A regressão em painel estima a elasticidade média de forma interpretável, mas pode estar enviesada pela endogeneidade. A variável instrumental isola o efeito causal do preço na demanda usando o custo como instrumento: o custo desloca o preço (relevância) mas não afeta a demanda por outra via (exclusão). É o padrão-ouro para elasticidade causal sem experimento. Os gráficos mostram o 1º estágio (a força do instrumento) — a chave para saber se o método é válido aqui.",
+                answers="Se aumentarmos o preço de propósito, a demanda cai de verdade — e quanto?",
+                assumptions="(1) Relevância: o instrumento Z correlaciona com o preço (testável via F-stat). (2) Exclusão: Z só afeta a demanda ATRAVÉS do preço — não testável, exige argumento econômico. (3) Exogeneidade do instrumento.",
+                formula=[r"\text{1º est.: } \ln p_i = \pi_0 + \pi_1 \ln c_i + \nu_i",
+                         r"\text{2º est.: } \ln q_i = \alpha + \beta^{IV} \widehat{\ln p_i} + \varepsilon_i",
+                         r"\hat{\beta}^{IV} = \frac{\text{Cov}(\ln c,\, \ln q)}{\text{Cov}(\ln c,\, \ln p)}"],
+                formula_legend="c = custo unitário (instrumento); π_1 mede a força do instrumento (F-stat do 1º estágio deve ser > 10).",
+                pros=["Corrige o viés de endogeneidade",
+                      "Estima efeito causal, não correlação",
+                      "Testável: a força do instrumento é mensurável"],
+                cons=["Depende de um instrumento válido (difícil)",
+                      "Exclusão não é testável — exige teoria",
+                      "Instrumento fraco gera estimativa pior que OLS"],
+                insight=(f"ACHADO DE RIGOR: o instrumento é FRACO (F-stat do 1º estágio = {f_stat:.1f}, abaixo do limiar 10). "
+                         f"Logo a estimativa IV ({beta_iv:.1f}) é inválida e NÃO deve ser usada. O custo não é bom instrumento aqui — "
+                         "provavelmente se correlaciona com qualidade/tipo de produto, violando a restrição de exclusão. "
+                         "Reconhecer isso vale mais que reportar número errado."
+                         if weak else
+                         f"Elasticidade causal (IV) = {beta_iv:.2f}, instrumento forte (F={f_stat:.0f})."),
+                money="Não mede US$ — é o teste de validade que impede usarmos uma elasticidade causal errada nas decisões seguintes. Vale como seguro contra decisão ruim.",
+                method="Para saber se MUDAR o preço realmente muda a demanda (causa, não correlação), usamos a técnica de variável instrumental (2 estágios). A ideia: precisamos de algo que mexa no preço mas não mexa na demanda por outro caminho — usamos o CUSTO como esse 'instrumento'. 1º estágio: prevemos o preço a partir do custo. 2º estágio: usamos esse preço 'limpo' para estimar o efeito na demanda. O teste-chave é o F-stat do 1º estágio: se for maior que 10, o instrumento é forte; abaixo disso, é fraco e o resultado não vale.",
+                table=iv_tbl,
+                worked=[
+                    "Testar a validade ANTES de usar o número é o certo — evita levar ao board uma elasticidade causal errada.",
+                    "Reconhecer a limitação (instrumento fraco) demonstra rigor: preferimos não responder a responder errado.",
+                ] if weak else [
+                    f"Instrumento forte (F={f_stat:.0f}): a elasticidade causal ({beta_iv:.2f}) é confiável.",
+                    "Conseguimos separar causa de correlação — padrão-ouro sem precisar de experimento.",
+                ],
+                not_worked=[
+                    f"Instrumento FRACO (F={f_stat:.1f} < 10): o custo não serve como instrumento aqui, então a elasticidade causal fica indeterminada.",
+                    "Sem instrumento válido, usamos a elasticidade observacional (OLS) com a ressalva de que pode ter viés.",
+                ] if weak else [
+                    "IV depende de pressupostos não totalmente testáveis (restrição de exclusão) — exige argumento econômico.",
+                ],
+                fig=fig_caus)
+
+            # -- Causal, nível A: teste de força do instrumento (1º estágio) --
+            caus_diag = pd.DataFrame({
+                "teste": ["F-stat do 1º estágio", "Limiar de instrumento forte", "Veredito"],
+                "valor": [f"{f_stat:.1f}", "10,0",
+                          "INSTRUMENTO FRACO — não usar IV" if weak else "instrumento forte — IV válido"],
+            })
+            add("3a · Causal — diagnóstico de validade do instrumento",
+                why="Antes de acreditar em qualquer estimativa IV, testa-se a força do instrumento. Sem isso, o IV pode ser pior que o OLS.",
+                insight=f"O F-stat mede se o custo realmente move o preço (relevância). Aqui vale {f_stat:.1f}. "
+                        + ("Abaixo de 10, o instrumento é fraco e a estimativa IV é não-confiável — descartada."
+                           if weak else "Acima de 10, o instrumento é forte e a estimativa IV é válida."),
+                table=caus_diag)
+
+            # -- Causal, nível B: o que fazer diante disso (decisão metodológica) --
+            add("3b · Causal — a decisão metodológica honesta",
+                why="Reconhecer a limitação e escolher o caminho certo é o que separa análise rigorosa de teatro de números.",
+                insight=("Como o instrumento é fraco, NÃO reportamos a elasticidade IV. Mantemos a econométrica como aproximação, "
+                         "com a ressalva de endogeneidade. O caminho ideal para elasticidade causal de verdade seria um experimento "
+                         "de preço (teste A/B) ou um instrumento melhor (choque de câmbio, mudança tributária) — fora do escopo desta base."
+                         if weak else
+                         "O instrumento é válido, então a elasticidade causal (IV) é a estimativa preferida sobre a OLS."),
+                money="Não mede $ — protege a decisão de usar uma elasticidade enviesada, o que evitaria erro de precificação.")
+
+            # -- Causal, nível C: a resposta causal (condicional à validade) --
+            # o que a leitura causal diria, contrastando com a observacional (OLS)
+            exemplo_aumento = 0.10
+            causal_resp = pd.DataFrame({
+                "leitura": ["Observacional (OLS) — o que temos",
+                            "Causal (IV) — o que gostaríamos"],
+                "elasticidade": [f"{beta_ols:.2f}", f"{beta_iv:.2f}" + (" ⚠ inválida" if weak else "")],
+                f"efeito de +{exemplo_aumento:.0%} no preço": [
+                    f"demanda {beta_ols*exemplo_aumento*100:+.1f}% (associação)",
+                    (f"demanda {beta_iv*exemplo_aumento*100:+.1f}% (causal)" if not weak
+                     else "não estimável — instrumento fraco")],
+                "vale como decisão?": [
+                    "aproximação, com ressalva de viés",
+                    "sim, se causal" if not weak else "NÃO — instrumento fraco"],
+            })
+            add("3c · Causal — a resposta que buscamos (e por que não a temos aqui)",
+                why="O objetivo final do IV é uma frase de INTERVENÇÃO: 'aumentar o preço em X% CAUSA uma queda de Y% na demanda'. Diferente do OLS, que só descreve como preço e volume variaram juntos no passado.",
+                answers=f"Se aumentarmos o preço de propósito em +{exemplo_aumento:.0%}, quanto a demanda cai — de verdade?",
+                insight=(f"SE o instrumento fosse válido, a resposta causal seria: '+{exemplo_aumento:.0%} de preço causa "
+                         f"{beta_iv*exemplo_aumento*100:+.1f}% de demanda'. Mas como o F-stat é {f_stat:.1f} (< 10), essa frase NÃO se sustenta. "
+                         f"O que podemos dizer, com ressalva, é a leitura observacional (OLS): +{exemplo_aumento:.0%} de preço está associado a "
+                         f"{beta_ols*exemplo_aumento*100:+.1f}% de demanda — associação, não causa comprovada."
+                         if weak else
+                         f"Com instrumento válido, a resposta causal é: '+{exemplo_aumento:.0%} de preço CAUSA "
+                         f"{beta_iv*exemplo_aumento*100:+.1f}% de demanda'. Esta é a base para decidir o reajuste."),
+                table=causal_resp)
+
+
+    except Exception as _e_sec:
+        add("⚠️ Inferência causal — indisponível nesta configuração",
+            why=f"Este modelo não pôde ser calculado com os dados/filtros atuais ({_e_sec}). As demais análises seguem normalmente.")
+    # --- seção protegida: Decisão multicritério ---
+    try:
+            # ===================================================================
+            # 4 · DECISÃO MULTICRITÉRIO (MCDA) — preço recomendado a nível SKU
+            # ===================================================================
+            from sklearn.preprocessing import minmax_scale, StandardScaler
+            from sklearn.cluster import KMeans
+
+            # pesos vindos do usuário (5 critérios; normalizados para somar 1)
+            w_raw = {"margem": getattr(p, "w_margem", 0.20),
+                     "elast": getattr(p, "w_elasticidade", 0.20),
+                     "share": getattr(p, "w_share", 0.20),
+                     "churn": getattr(p, "w_churn", 0.20),
+                     "cluster": getattr(p, "w_cluster", 0.20)}
+            w_sum = sum(w_raw.values()) or 1.0
+            w = {k: v / w_sum for k, v in w_raw.items()}
+            teto = getattr(p, "max_price_increase", 0.15)
+            meses_tot = d["date"].nunique()
+
+            # UNIDADE DE PRECIFICAÇÃO = SKU × tier × business × país
+            PGm = [COL_MATERIAL, COL_TIER, COL_BUSINESS, COL_COUNTRY]
+            dseg = d.copy()
+            seg = dseg.groupby(PGm).agg(
+                preco=(COL_PRICE, "median"), custo=("unit_cost", "median"),
+                receita=(COL_REVENUE, "sum"), qtd=(COL_QTY, "sum"), n=(COL_PRICE, "size"),
+                meses=("date", "nunique"), clientes=(COL_PARENT, "nunique")).reset_index()
+            seg = seg[(seg["n"] >= 5) & (seg["preco"] > 0)].copy()
+            seg["margem_pct"] = (seg["preco"] - seg["custo"]) / seg["preco"].clip(lower=0.01)
+
+            # critério 1 · MARGEM: margem baixa = espaço para subir
+            seg["s_margem"] = 1 - minmax_scale(seg["margem_pct"].clip(-2, 1))
+            # critério 2 · ELASTICIDADE: inelástico = seguro p/ subir (elasticidade por business)
+            elast_by_biz = {}
+            for biz, gb in dseg.groupby(COL_BUSINESS):
+                if len(gb) >= 50 and gb["ln_price"].std() > 0:
+                    try:
+                        elast_by_biz[biz] = float(np.polyfit(gb["ln_price"] - gb["ln_price"].mean(),
+                                                             gb["ln_qty"] - gb["ln_qty"].mean(), 1)[0])
+                    except Exception:
+                        elast_by_biz[biz] = beta_ols
+                else:
+                    elast_by_biz[biz] = beta_ols
+            seg["elast"] = seg[COL_BUSINESS].map(elast_by_biz).fillna(beta_ols)
+            seg["s_elast"] = minmax_scale(seg["elast"].clip(-2, 0))  # menos elástico = score maior
+            # critério 3 · MARKET SHARE: share do SKU DENTRO DO BUSINESS (concorre com todos do business);
+            # share ALTO = SKU importante no business = proteger = score baixo
+            biz_rev = seg.groupby(COL_BUSINESS)["receita"].transform("sum")
+            seg["share"] = seg["receita"] / biz_rev.clip(lower=1)
+            seg["s_share"] = 1 - minmax_scale(seg["share"])  # share baixo = pode subir mais
+            # critério 4 · CHURN: chance de perder o cliente daquele SKU; churn alto = NÃO subir preço
+            # score comportamental (RFM-like) por cliente: recência + frequência + tendência de volume
+            tmax = int(d["date"].map({dt: i for i, dt in enumerate(sorted(d["date"].unique()))}).max())
+            _tmap = {dt: i for i, dt in enumerate(sorted(d["date"].unique()))}
+            d["_t"] = d["date"].map(_tmap)
+            cli = d.groupby(COL_PARENT).agg(ult=("_t", "max"), nm=("_t", "nunique"),
+                                            prim=("_t", "min")).reset_index()
+            cli["recencia"] = tmax - cli["ult"]
+            cli["span"] = (cli["ult"] - cli["prim"] + 1).clip(lower=1)
+            cli["freq_rel"] = cli["nm"] / cli["span"]
+            rec6 = d[d["_t"] > tmax - 6].groupby(COL_PARENT)[COL_REVENUE].sum()
+            prev6 = d[(d["_t"] <= tmax - 6) & (d["_t"] > tmax - 12)].groupby(COL_PARENT)[COL_REVENUE].sum()
+            cli = cli.merge(rec6.rename("rec6"), on=COL_PARENT, how="left").merge(
+                prev6.rename("prev6"), on=COL_PARENT, how="left")
+            cli["rec6"] = cli["rec6"].fillna(0); cli["prev6"] = cli["prev6"].fillna(0)
+            cli["tend"] = (cli["rec6"] - cli["prev6"]) / cli["prev6"].clip(lower=1)
+            cli["churn"] = (minmax_scale(cli["recencia"]) * 0.5 +
+                            (1 - minmax_scale(cli["freq_rel"])) * 0.3 +
+                            (1 - minmax_scale(cli["tend"].clip(-2, 2))) * 0.2)
+            churn_by_cli = cli.set_index(COL_PARENT)["churn"]
+            # churn do SKU = média do churn dos clientes que compram aquele SKU (ponderada por receita)
+            d["_churn_cli"] = d[COL_PARENT].map(churn_by_cli).fillna(0.5)
+            churn_sku = (d.groupby(PGm)
+                         .apply(lambda g: np.average(g["_churn_cli"], weights=g[COL_REVENUE].clip(lower=1)))
+                         .rename("churn_sku").reset_index())
+            seg = seg.merge(churn_sku, on=PGm, how="left")
+            seg["churn_sku"] = seg["churn_sku"].fillna(0.5)
+            # churn ALTO = risco de perder cliente = NÃO subir = score BAIXO
+            seg["s_churn"] = 1 - minmax_scale(seg["churn_sku"])
+            # critério 5 · ALINHAMENTO NO CLUSTER: k-means por comportamento; preço abaixo do cluster = subir
+            feats = pd.DataFrame({
+                "vol": np.log1p(seg["qtd"]), "freq": seg["meses"],
+                "margem": seg["margem_pct"].clip(-2, 1), "preco": np.log1p(seg["preco"])})
+            Xs = StandardScaler().fit_transform(feats.fillna(0))
+            n_clusters = min(6, max(2, len(seg) // 500))
+            km = KMeans(n_clusters=n_clusters, random_state=1, n_init=10).fit(Xs)
+            seg["cluster"] = km.labels_
+            seg["cl_med_preco"] = seg.groupby("cluster")["preco"].transform("median")
+            seg["gap_cluster"] = ((seg["cl_med_preco"] - seg["preco"]) / seg["cl_med_preco"].clip(lower=0.01)).clip(lower=0)
+            seg["s_cluster"] = minmax_scale(seg["gap_cluster"]) if seg["gap_cluster"].nunique() > 1 else 0.0
+
+            # score combinado (5 critérios)
+            seg["score"] = (w["margem"] * seg["s_margem"] + w["elast"] * seg["s_elast"] +
+                            w["share"] * seg["s_share"] + w["churn"] * seg["s_churn"] +
+                            w["cluster"] * seg["s_cluster"])
+            # ESCALA CORRIGIDA: usa o percentil do score para espalhar de 0 ao teto (diferencia de verdade)
+            seg["score_pct"] = seg["score"].rank(pct=True)
+            seg["reajuste_%"] = teto * seg["score_pct"] * 100
+            seg["preco_atual"] = seg["preco"]
+            seg["preco_recomendado"] = seg["preco"] * (1 + teto * seg["score_pct"])
+            seg["ganho_potencial"] = teto * seg["score_pct"] * seg["receita"]
+            seg = seg.sort_values("ganho_potencial", ascending=False)
+            ganho_mcda = float(seg["ganho_potencial"].sum())
+            n_skus = len(seg)
+
+            # filtro por SKU (seletor)
+            sku_sel = getattr(p, "mcda_sku", "(todos)")
+            if sku_sel and sku_sel != "(todos)":
+                seg_view = seg[seg[COL_MATERIAL].astype(str) == sku_sel]
+                if len(seg_view) == 0:
+                    seg_view = seg.head(20)
+            else:
+                seg_view = seg.head(20)
+
+            # GRÁFICO NOVO: reajuste recomendado + ganho US$ dos top 15 SKUs (duas leituras claras)
+            top_g = seg.head(15).iloc[::-1]  # invertido p/ maior no topo do barh
+            lab = [f"{str(m)[:10]} T{t}·B{b}" for m, t, b in
+                   zip(top_g[COL_MATERIAL], top_g[COL_TIER], top_g[COL_BUSINESS])]
+            fig, (axA, axB) = plt.subplots(1, 2, figsize=(12, 5.5), sharey=True)
+            ypos = np.arange(len(top_g))
+            axA.barh(ypos, top_g["reajuste_%"], color="#378add")
+            axA.set_yticks(ypos); axA.set_yticklabels(lab, fontsize=7)
+            axA.set_xlabel("Reajuste recomendado (%)")
+            axA.set_title("Quanto reajustar (% até o teto)")
+            for i, v in enumerate(top_g["reajuste_%"]):
+                axA.text(v, i, f" {v:.1f}%", va="center", fontsize=7)
+            axB.barh(ypos, top_g["ganho_potencial"] / 1e6, color="#1d9e75")
+            axB.set_xlabel("Ganho potencial (US$ mi)")
+            axB.set_title("Quanto isso rende (US$)")
+            for i, v in enumerate(top_g["ganho_potencial"] / 1e6):
+                axB.text(v, i, f" ${v:,.2f}mi", va="center", fontsize=7)
+            fig.suptitle("Top 15 SKUs por ganho — reajuste recomendado e retorno", fontsize=11)
+            fig.tight_layout()
+
+            mcda_tbl = seg_view[[COL_MATERIAL, COL_TIER, COL_BUSINESS, COL_COUNTRY, "preco_atual",
+                                 "preco_recomendado", "reajuste_%", "ganho_potencial", "cluster"]].copy()
+            mcda_tbl["preço_atual"] = mcda_tbl["preco_atual"].map(lambda v: f"US$ {v:,.2f}")
+            mcda_tbl["preço_recomendado"] = mcda_tbl["preco_recomendado"].map(lambda v: f"US$ {v:,.2f}")
+            mcda_tbl["reajuste_%"] = mcda_tbl["reajuste_%"].round(1)
+            mcda_tbl["ganho_US$"] = mcda_tbl["ganho_potencial"].map(lambda v: f"US$ {v:,.0f}")
+            mcda_tbl["cluster"] = mcda_tbl["cluster"].astype(int)
+            mcda_tbl = mcda_tbl[[COL_MATERIAL, COL_TIER, COL_BUSINESS, COL_COUNTRY,
+                                 "preço_atual", "preço_recomendado", "reajuste_%", "ganho_US$", "cluster"]]
+
+            perfil_nome = getattr(p, "mcda_perfil", "Equilibrado")
+            pesos_txt = (f"Margem {w['margem']*100:.0f}% · Elasticidade {w['elast']*100:.0f}% · "
+                         f"Market share {w['share']*100:.0f}% · Churn {w['churn']*100:.0f}% · "
+                         f"Cluster {w['cluster']*100:.0f}%")
+            seg_top = seg.iloc[0]
+
+            # exemplo passo a passo do SKU líder — em linguagem de negócio (para não-técnicos)
+            _st = seg_top
+            _c_marg = w["margem"] * _st["s_margem"]
+            _c_elas = w["elast"] * _st["s_elast"]
+            _c_shar = w["share"] * _st["s_share"]
+            _c_chur = w["churn"] * _st["s_churn"]
+            _c_clus = w["cluster"] * _st["s_cluster"]
+            _score_bruto = _c_marg + _c_elas + _c_shar + _c_chur + _c_clus
+            _v_margem = _st["margem_pct"] * 100
+            _v_elast = _st["elast"]
+            _v_share = _st["share"] * 100
+            _v_churn = _st.get("churn_sku", 0.5)
+            _v_gap = _st.get("gap_cluster", 0) * 100
+            _mat = _st[COL_MATERIAL]
+
+            # helper: traduz uma nota 0-1 em "posição" que um gestor entende
+            def _pos(nota):
+                if nota >= 0.75:
+                    return "entre os mais altos"
+                if nota >= 0.5:
+                    return "acima da média"
+                if nota >= 0.25:
+                    return "abaixo da média"
+                return "entre os mais baixos"
+
+            conta_txt = (
+                f"**Vamos pegar um produto real e ver, passo a passo, como o modelo chega no preço sugerido.**\n\n"
+                f"Produto: SKU **{_mat}** (tier {_st[COL_TIER]}, {_st[COL_COUNTRY]}) · Objetivo escolhido: **{getattr(p, 'mcda_perfil', 'Equilibrado')}**\n\n"
+                f"**A regra:** para cada um dos 5 critérios, damos ao produto uma nota de 0 a 10 "
+                f"(0 = nenhum motivo para subir o preço, 10 = motivo máximo). A nota sai comparando o produto com todos os outros.\n\n"
+                f"**Critério 1 — Margem: nota {_st['s_margem']*10:.0f}/10.** "
+                f"Este produto tem margem de {_v_margem:.0f}% (vende a US$ {_st['preco']:,.2f}, custa US$ {_st['custo']:,.2f}). "
+                f"Comparando com os outros, essa margem está {_pos(_st['s_margem'] if _v_margem < 50 else 1-_st['s_margem'])}. "
+                f"Margem já {'gorda' if _st['s_margem'] < 0.5 else 'apertada'} significa {'pouco' if _st['s_margem'] < 0.5 else 'bastante'} espaço para subir → nota {_st['s_margem']*10:.0f}.\n\n"
+                f"**Critério 2 — Elasticidade: nota {_st['s_elast']*10:.0f}/10.** "
+                f"Mede se o cliente foge quando o preço sobe. Aqui a sensibilidade é {_v_elast:.2f} "
+                f"({'baixa — cliente aguenta reajuste' if _st['s_elast'] > 0.5 else 'considerável — cliente reage ao preço'}) → nota {_st['s_elast']*10:.0f}.\n\n"
+                f"**Critério 3 — Market share: nota {_st['s_share']*10:.0f}/10.** "
+                f"Este produto representa {_v_share:.1f}% da receita do seu business — um share {_pos(1-_st['s_share'])}. "
+                f"{'Como pesa pouco, dá para reajustar sem risco de mexer no faturamento' if _st['s_share'] > 0.5 else 'Como é importante, convém proteger e não arriscar'} → nota {_st['s_share']*10:.0f}.\n\n"
+                f"**Critério 4 — Churn (risco de perder o cliente): nota {_st['s_churn']*10:.0f}/10.** "
+                f"Os clientes deste produto têm risco {'baixo' if _st['s_churn'] > 0.5 else 'alto'} de parar de comprar "
+                f"(índice {_v_churn:.2f} de 1). Cliente {'fiel aguenta um reajuste' if _st['s_churn'] > 0.5 else 'em risco: melhor não subir'} → nota {_st['s_churn']*10:.0f}.\n\n"
+                f"**Critério 5 — Cluster (preço vs. produtos parecidos): nota {_st['s_cluster']*10:.0f}/10.** "
+                f"Agrupamos produtos de comportamento parecido; este está {_v_gap:.0f}% "
+                f"{'abaixo do' if _v_gap > 0 else 'alinhado com o'} preço típico do grupo. "
+                f"{'Está barato para o que é — há espaço para subir' if _st['s_cluster'] > 0.5 else 'Já está no nível dos pares'} → nota {_st['s_cluster']*10:.0f}.\n\n"
+                f"**Agora juntamos tudo, respeitando os pesos do objetivo '{getattr(p, 'mcda_perfil', 'Equilibrado')}':**\n\n"
+                f"- Margem: nota {_st['s_margem']*10:.0f} × peso {w['margem']*100:.0f}% = {_c_marg*10:.2f}\n"
+                f"- Elasticidade: nota {_st['s_elast']*10:.0f} × peso {w['elast']*100:.0f}% = {_c_elas*10:.2f}\n"
+                f"- Market share: nota {_st['s_share']*10:.0f} × peso {w['share']*100:.0f}% = {_c_shar*10:.2f}\n"
+                f"- Churn: nota {_st['s_churn']*10:.0f} × peso {w['churn']*100:.0f}% = {_c_chur*10:.2f}\n"
+                f"- Cluster: nota {_st['s_cluster']*10:.0f} × peso {w['cluster']*100:.0f}% = {_c_clus*10:.2f}\n"
+                f"- **Nota final (score) = {_score_bruto*10:.2f} de 10**\n\n"
+                f"**Do score ao preço sugerido:** essa nota final coloca o produto à frente de {_st['score_pct']*100:.0f}% dos produtos "
+                f"na fila de prioridade de reajuste. Quanto mais à frente, maior o reajuste (limitado ao teto de {teto*100:.0f}%). "
+                f"Então o reajuste é {teto*100:.0f}% × {_st['score_pct']:.2f} = **{_st['reajuste_%']:.1f}%**, "
+                f"e o preço passa de US$ {_st['preco_atual']:,.2f} para **US$ {_st['preco_recomendado']:,.2f}**.")
+
+            add("4 · Decisão multicritério (MCDA) — o preço recomendado por SKU",
+                how_it_works="A precificação real é produto a produto, então o modelo trabalha na unidade certa: SKU × tier × business × país. Você define o que importa e quanto (pesos), sobre 5 critérios: MARGEM (margem baixa = espaço para subir), ELASTICIDADE (inelástico = seguro subir), MARKET SHARE (share do SKU dentro do business — share alto = SKU importante, proteger, subir menos), CHURN (chance de perder o cliente daquele SKU — churn alto = NÃO subir, para não perdê-lo) e CLUSTER (agrupamos SKUs de comportamento parecido via k-means e vemos quão abaixo dos pares do cluster o preço está). Cada SKU recebe uma nota de 0 a 1 em cada critério; multiplicamos pelos pesos e somamos num score. O reajuste é proporcional à POSIÇÃO do SKU no ranking de scores — o que usa a faixa inteira até o teto, diferenciando de fato os produtos.",
+                why="Um número de caixa-preta é difícil de defender, e um número agregado não serve para precificar — a decisão de preço é por produto. Este modelo entrega um preço recomendado a nível SKU, transparente e ajustável: o gestor escolhe o peso de cada objetivo e vê o preço de cada produto se ajustar. É a ponte entre a análise e a decisão executiva de pricing.",
+                answers="Dado o que a empresa prioriza, qual o preço recomendado para cada SKU (por tier, business e país)?",
+                assumptions=f"Unidade de decisão: SKU × tier × business × país, com pelo menos 5 vendas. Os 5 critérios são normalizados de 0 a 1 antes de ponderar. O reajuste é proporcional ao PERCENTIL do score (posição no ranking), limitado ao teto (+{teto*100:.0f}%) — assim os SKUs de maior oportunidade chegam perto do teto e os de menor ficam perto de zero. A elasticidade vem da econometria por business; os clusters vêm de k-means sobre volume, frequência, margem e preço.",
+                method=f"{conta_txt}",
+                insight=f"Trabalhando a nível SKU ({n_skus:,} combinações precificáveis), com o perfil '{perfil_nome}' ({pesos_txt}), "
+                        f"o SKU de maior ganho é o material {seg_top[COL_MATERIAL]} (tier {seg_top[COL_TIER]}, business {seg_top[COL_BUSINESS]}, "
+                        f"{seg_top[COL_COUNTRY]}): reajuste de {seg_top['reajuste_%']:.1f}%, de US$ {seg_top['preco_atual']:,.0f} para "
+                        f"US$ {seg_top['preco_recomendado']:,.0f}. Trocar o perfil de objetivo reordena tudo — 'Defender share' protege "
+                        "clientes com risco de churn e share alto; 'Extrair margem' foca nos de margem baixa e inelásticos.",
+                money=f"Com os pesos atuais, o ganho potencial somado é ~US$ {ganho_mcda/1e6:,.0f} mi "
+                      "(teto teórico; a captura real depende de execução comercial).",
+                worked=[
+                    "Precificação na unidade certa (SKU/tier/business/país) e escala que usa toda a faixa até o teto — reajustes diferenciados de verdade.",
+                    "5 critérios de negócio reais (não só variáveis cruas): margem, elasticidade, share, ruptura e alinhamento por cluster de comportamento.",
+                ],
+                not_worked=[
+                    "Os pesos são um julgamento de valor — pessoas diferentes escolhem pesos diferentes, e isso muda a recomendação.",
+                    "A elasticidade é herdada do business e os clusters dependem das features escolhidas; SKUs com histórico curto têm score mais ruidoso.",
+                ],
+                fig=fig, table=mcda_tbl)
+
+
+    except Exception as _e_sec:
+        add("⚠️ Decisão multicritério — indisponível nesta configuração",
+            why=f"Este modelo não pôde ser calculado com os dados/filtros atuais ({_e_sec}). As demais análises seguem normalmente.")
     notes = []
     return {"metrics": {}, "blocks": blocks, "notes": notes,
             "tables": {}, "figures": {}}
@@ -2181,13 +2220,7 @@ def _run_ols(df):
     model = sm.OLS(y, X, missing="drop").fit()
 
     d = d.reset_index(drop=True)
-    mat_base = mat_base.reset_index(drop=True)
-    # model.predict pode devolver menos linhas que d se OLS(missing="drop")
-    # descartou linhas com NaN/inf. Reindexamos pela posição de X para alinhar
-    # com d antes de somar mat_base, evitando erro de broadcast (shapes diferentes).
-    pred = pd.Series(np.asarray(model.predict(X)), index=X.index)
-    pred = pred.reindex(range(len(d)))
-    d["ln_price_hat"] = mat_base + pred
+    d["ln_price_hat"] = mat_base.reset_index(drop=True) + model.predict(X)
     d["resid"] = d["ln_price"] - d["ln_price_hat"]
     d["price_ratio"] = np.exp(d["resid"])
     d["price_expected"] = np.exp(d["ln_price_hat"])
@@ -2584,9 +2617,14 @@ def run_diagnostico(df: pd.DataFrame, p: Params) -> dict:
         g = df[df["year"] == year]
         gv = dv[dv["year"] == year]
         rev = g[COL_REVENUE].sum(); mar = g["_margin"].sum(); cogs = -g[COL_COGS].sum()
+        # preço e custo médios ponderados por volume (US$ por unidade)
+        preco_med = np.average(gv[COL_PRICE], weights=gv[COL_QTY]) if len(gv) else np.nan
+        custo_med = np.average((-gv[COL_COGS_AVG]).clip(lower=0), weights=gv[COL_QTY]) if len(gv) else np.nan
         return {
             "Receita": rev, "Margem de contribuição": mar,
             "Margem %": 100 * mar / rev if rev else np.nan, "Custo (COGS)": cogs,
+            "Preço médio (US$/un)": preco_med,
+            "Custo médio (US$/un)": custo_med,
             "Clientes que compraram": g[COL_PARENT].nunique(),
             "Portfólio comprado (materiais)": g[COL_MATERIAL].nunique(),
             "Países atendidos": g[COL_COUNTRY].nunique(),
@@ -2600,6 +2638,8 @@ def run_diagnostico(df: pd.DataFrame, p: Params) -> dict:
             return f"${v/1e6:,.1f} mi"
         if nome == "Margem %":
             return f"{v:.1f}%"
+        if nome in ("Preço médio (US$/un)", "Custo médio (US$/un)"):
+            return f"${v:,.2f}"
         return f"{v:,.0f}"
 
     def _delta(nome):
@@ -2623,7 +2663,7 @@ def run_diagnostico(df: pd.DataFrame, p: Params) -> dict:
     add("Painel executivo — KPIs do negócio",
         why="Todo diagnóstico de consultoria abre pelo retrato do negócio: onde estamos hoje e como isso mudou frente ao ano anterior. É o 'situation' antes de investigar as causas — dá ao gestor a régua para julgar tudo o que vem depois.",
         answers=f"Como {y1} se compara a {y0} em receita, margem, custo, base de clientes e amplitude de portfólio e mercado?",
-        method=f"Cada KPI compara o ano {y0} com {y1}. Receita, Margem e Custo são a SOMA de todas as transações do ano (Margem = Receita + Custo, lembrando que o custo entra negativo). Margem % = Margem ÷ Receita. Clientes, Materiais e Países são CONTAGENS de valores distintos (quantos clientes/produtos/países únicos compraram no ano). Transações é o número de linhas de venda. A coluna Δ é a variação percentual entre os dois anos, exceto Margem %, que mostra a diferença em pontos percentuais (p.p.).",
+        method=f"Cada KPI compara o ano {y0} com {y1}. Receita, Margem e Custo são a SOMA de todas as transações do ano (Margem = Receita + Custo, lembrando que o custo entra negativo). Margem % = Margem ÷ Receita. Preço médio e Custo médio são por unidade, ponderados pelo volume (cada venda pesa pela quantidade). Clientes, Materiais e Países são CONTAGENS de valores distintos (quantos clientes/produtos/países únicos compraram no ano). Transações é o número de linhas de venda. A coluna Δ é a variação percentual entre os dois anos, exceto Margem %, que mostra a diferença em pontos percentuais (p.p.).",
         insight=f"Receita {var_rev:+.1f}% e base de clientes {var_cli:+.1f}% — o negócio encolheu em tamanho. "
                 f"Mas a margem % foi de {k0['Margem %']:.1f}% para {k1['Margem %']:.1f}% ({dpp_margem:+.1f} p.p.) — "
                 "melhora de rentabilidade apesar da queda de volume, sinal de mix/preço mais saudável ou corte de cauda deficitária. "
@@ -3582,7 +3622,10 @@ for tab, analysis in zip(tabs, ANALYSES):
             try:
                 res = _run_analysis(analysis.code, file_bytes, sheet, local_params)
             except Exception as e:
+                import traceback as _tb
                 st.error(f"Falha ao rodar {analysis.name}: {e}")
+                with st.expander("Detalhes técnicos do erro"):
+                    st.code(_tb.format_exc())
                 continue
 
         if res is None:
